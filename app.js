@@ -48,12 +48,26 @@ let currentHistoryFilter = "6m";
  * ============================================================================ */
 
 /**
- * [2.1] URL-Encoded GET 通訊包裝器
- * 統一透過 GET 搭配 ?payload=URL-Encoded-JSON 呼叫 GAS API，100% 規避瀏覽器 POST 302 CORS 阻擋。
- * 若雲端舊版部署尚未開啟 doGet 路由而回傳預設健康檢查訊息，自動以 text/plain 簡單請求無縫銜接。
+ * [2.1] 讀寫分流通訊包裝器 (callGasApi)
+ * - 寫入操作 (submitQuiz)：帶有完整答題快照 snapshots，資料量龐大，強制自動切換為免預檢 POST (text/plain;charset=utf-8)
+ *   徹底解除瀏覽器與 Google Apps Script URL 2KB 長度上限，同時免除 OPTIONS 預檢並安全穿透 302 重導向。
+ * - 查詢操作 (login, getInitialData)：使用 URL-Encoded GET 搭配相容性 POST 備援通道，維持極速查詢。
  */
 async function callGasApi(action, dataObj = {}) {
   const payload = { action, ...dataObj };
+
+  // 1. 大型寫入型操作：強制使用 POST (text/plain;charset=utf-8) 避開 URL 長度限制與 preflight CORS
+  if (action === "submitQuiz") {
+    const postResponse = await fetch(GAS_ENDPOINT_URL, {
+      method: "POST",
+      mode: "cors",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify(payload)
+    });
+    return await postResponse.json();
+  }
+
+  // 2. 輕量查詢型操作：預設使用 GET ?payload=...
   const url = `${GAS_ENDPOINT_URL}?payload=${encodeURIComponent(JSON.stringify(payload))}`;
   const response = await fetch(url, { method: "GET", mode: "cors" });
   const result = await response.json();
@@ -73,115 +87,270 @@ async function callGasApi(action, dataObj = {}) {
 }
 
 /**
- * 雲端觀念資料正規化器：確保 8 欄結構與舊版欄位偏移皆能精準對應
+ * [2.1.1] 通用 LaTeX 語法健檢與自動修復器 (sanitizeAndRepairLatex)
+ * 解決未閉合 $、未閉合 \text{}、損壞的 $$ 前綴、管道符號切斷與殘缺字符問題
+ */
+function sanitizeAndRepairLatex(rawStr) {
+  if (rawStr === null || rawStr === undefined) return "";
+  let s = String(rawStr).trim();
+  if (!s) return "";
+
+  // 1. 去除首尾的孤立管道符號與多餘反斜線
+  s = s.replace(/^[\|\\]+|[\|\\]+$/g, "").trim();
+
+  // 2. 清理試算表歷史遺留的文字干擾片段（例如 "$刻 $", "$為 $"）
+  s = s.replace(/\$刻\s*\$/g, "").replace(/\$為\s*\$/g, "");
+  s = s.replace(/\$\s+\$/g, "$");
+
+  // 3. 修復 "$$...$"（開頭為雙錢號、結尾為單錢號）
+  s = s.replace(/\$\$([^$]+)\$/g, "$$1$");
+
+  // 4. 修復常見單位殘缺（例如 "$0\text{$" -> "$0\text{ m}$", "$24\text{$" -> "$24\text{ m}$"）
+  s = s.replace(/(\d+)\s*\\text\{\s*(\$)?$/g, "$1\\text{ m}$2");
+  s = s.replace(/\\text\{\s*m\s*(\$)?$/gi, "\\text{ m}$1");
+
+  // 5. 修復 \text{ 內未閉合花括號即接 $ 的情況
+  s = s.replace(/\\text\{([^}]+)\$/g, "\\text{$1}$");
+
+  // 6. 花括號配對檢查：若開括號 { 多於 閉括號 }，在末尾（若有 $ 則在 $ 前）補齊 }
+  const openBraces = (s.match(/\{/g) || []).length;
+  const closeBraces = (s.match(/\}/g) || []).length;
+  if (openBraces > closeBraces) {
+    const diff = openBraces - closeBraces;
+    if (s.endsWith("$")) {
+      s = s.slice(0, -1) + "}".repeat(diff) + "$";
+    } else {
+      s = s + "}".repeat(diff);
+    }
+  }
+
+  // 7. $ 配對檢查（排除 \$）：若為奇數個 $，在末尾補上 $
+  const cleanForCount = s.replace(/\\\$/g, "");
+  const dollarCount = (cleanForCount.match(/\$/g) || []).length;
+  if (dollarCount % 2 === 1) {
+    s = s + "$";
+  }
+
+  return s.trim();
+}
+
+/**
+ * [2.1.2] 雲端歷史題庫選項專屬修補表 (避免歷史試算表因 | 分隔符號或儲存格損壞造成之殘缺字串)
+ */
+const QUESTION_DISTRACTOR_PATCHES = {
+  "q_kin_01_03_a": [
+    "$+5\\text{ m}$",
+    "$+1\\text{ m}$",
+    "$-1\\text{ m}$",
+    "$0\\text{ m}$"
+  ],
+  "q_kin_01_03_b": [
+    "$10\\text{ m}$",
+    "$5\\text{ m}$",
+    "$-5\\text{ m}$",
+    "$8\\text{ m}$"
+  ],
+  "q_kin_01_04_a": [
+    "純量和，且大小為 $11\\text{ m}$",
+    "向量差，且大小為 $11\\text{ m}$",
+    "純量和，且大小為 $5\\text{ m}$",
+    "乘積，且大小為 $24\\text{ m}$"
+  ],
+  "q_kin_01_05_a": [
+    "$5\\text{ m}$（為各段位移之向量和）",
+    "$-5\\text{ m}$",
+    "$0\\text{ m}$",
+    "$24\\text{ m}$"
+  ],
+  "q_kin_02_01_b": [
+    "「第 4 秒末」代表時刻 $t = 4\\text{ s}$",
+    "「第 4 秒內」代表時距由 $t = 3\\text{ s}$ 至 $t = 4\\text{ s}$（歷時 $1\\text{ s}$）",
+    "「前 4 秒」代表時距由 $t = 0\\text{ s}$ 至 $t = 4\\text{ s}$（歷時 $4\\text{ s}$）",
+    "「第 4 秒」通常指時刻 $t = 4\\text{ s}$"
+  ],
+  "q_kin_02_02_a": [
+    "$t_1$ 該時刻點之切線斜率",
+    "$t_2$ 該時刻點之切線斜率",
+    "$v$-$t$ 曲線與時間軸所圍成的面積",
+    "該時段內各點切線斜率的算術平均值"
+  ],
+  "q_kin_02_03_a": [
+    "瞬時加速度必定為 0",
+    "在該時段內的總路程為 0",
+    "該質點恰好通過坐標原點 $x = 0$",
+    "質點正在作等速度運動"
+  ],
+  "q_kin_02_04_a": [
+    "$\\vec{v}_a = \\frac{\\Delta S}{\\Delta t}$（純量）；$\\bar{v} = \\frac{\\Delta\\vec{x}}{\\Delta t}$（向量）",
+    "兩者皆為純量，公式均為 $\\frac{\\Delta S}{\\Delta t}$",
+    "兩者皆為向量，公式均為 $\\frac{\\Delta\\vec{x}}{\\Delta t}$",
+    "$\\vec{v}$ 為瞬時量；$\\bar{v}$ 為時距平均量"
+  ],
+  "q_kin_02_05_a": [
+    "$\\bar{v} = 3\\text{ m/s}$，$\\Vert{}\\vec{v}_a\\Vert{} = 7\\text{ m/s}$",
+    "$\\bar{v} = 5\\text{ m/s}$，$\\Vert{}\\vec{v}_a\\Vert{} = 5\\text{ m/s}$",
+    "$\\bar{v} = 8\\text{ m/s}$，$\\Vert{}\\vec{v}_a\\Vert{} = 3\\text{ m/s}$",
+    "$\\bar{v} = 7\\text{ m/s}$，$\\Vert{}\\vec{v}_a\\Vert{} = 7\\text{ m/s}$"
+  ],
+  "q_kin_02_06_a": [
+    "只有在等速度運動時，$v = \\Vert{}\\vec{v}\\Vert{}$ 才會成立",
+    "瞬時速率恆大於瞬時速度之量值（$v > \\Vert{}\\vec{v}\\Vert{}$）",
+    "瞬時速率可能為負值，瞬時速度量值恆為正值",
+    "兩者完全無關，無法進行比較"
+  ]
+};
+
+/**
+ * 雲端觀念資料正規化器：確保 8 欄結構與舊版欄位偏移皆能精準對應，並通過 LaTeX 修復器
  */
 function normalizeConceptItem(raw) {
   if (!raw) return null;
 
+  let cid = "";
+  let mainCat = "未分類講義";
+  let subCat = "未分類觀念";
+  let title = "";
+  let contentType = "text";
+  let definition = "";
+  let premise = "";
+  let explanation = "";
+
   // 標準 8 欄結構
   if (raw.main_category !== undefined && raw.sub_category !== undefined) {
-    return {
-      concept_id: String(raw.concept_id || "").trim(),
-      main_category: String(raw.main_category || "未分類講義").trim(),
-      sub_category: String(raw.sub_category || "未分類觀念").trim(),
-      title: String(raw.title || "").trim(),
-      content_type: String(raw.content_type || "text").trim(),
-      definition: String(raw.definition || "").trim(),
-      premise: String(raw.premise || "").trim(),
-      explanation: String(raw.explanation || "").trim()
-    };
-  }
-
-  // 相容雲端試算表 8 欄但舊版 GAS 以 7 欄讀取之偏移映射
-  if (raw.unit !== undefined && raw.definition === "text") {
-    return {
-      concept_id: String(raw.concept_id || "").trim(),
-      main_category: String(raw.unit || "未分類講義").trim(),
-      sub_category: String(raw.title || "未分類觀念").trim(),
-      title: String(raw.content_type || "").trim(),
-      content_type: "text",
-      definition: String(raw.premise || "").trim(),
-      premise: String(raw.explanation || "").trim(),
-      explanation: ""
-    };
+    cid = String(raw.concept_id || "").trim();
+    mainCat = String(raw.main_category || "未分類講義").trim();
+    subCat = String(raw.sub_category || "未分類觀念").trim();
+    title = String(raw.title || "").trim();
+    contentType = String(raw.content_type || "text").trim();
+    definition = String(raw.definition || "").trim();
+    premise = String(raw.premise || "").trim();
+    explanation = String(raw.explanation || "").trim();
+  } else if (raw.unit !== undefined && raw.definition === "text") {
+    // 相容雲端試算表 8 欄但舊版 GAS 以 7 欄讀取之偏移映射
+    cid = String(raw.concept_id || "").trim();
+    mainCat = String(raw.unit || "未分類講義").trim();
+    subCat = String(raw.title || "未分類觀念").trim();
+    title = String(raw.content_type || "").trim();
+    contentType = "text";
+    definition = String(raw.premise || "").trim();
+    premise = String(raw.explanation || "").trim();
+    explanation = "";
+  } else {
+    cid = String(raw.concept_id || "").trim();
+    mainCat = String(raw.main_category || raw.unit || "未分類講義").trim();
+    subCat = String(raw.sub_category || raw.title || "未分類觀念").trim();
+    title = String(raw.title || "").trim();
+    contentType = String(raw.content_type || "text").trim();
+    definition = String(raw.definition || "").trim();
+    premise = String(raw.premise || "").trim();
+    explanation = String(raw.explanation || "").trim();
   }
 
   return {
-    concept_id: String(raw.concept_id || "").trim(),
-    main_category: String(raw.main_category || raw.unit || "未分類講義").trim(),
-    sub_category: String(raw.sub_category || raw.title || "未分類觀念").trim(),
-    title: String(raw.title || "").trim(),
-    content_type: String(raw.content_type || "text").trim(),
-    definition: String(raw.definition || "").trim(),
-    premise: String(raw.premise || "").trim(),
-    explanation: String(raw.explanation || "").trim()
+    concept_id: cid,
+    main_category: mainCat,
+    sub_category: subCat,
+    title: sanitizeAndRepairLatex(title),
+    content_type: contentType,
+    definition: sanitizeAndRepairLatex(definition),
+    premise: sanitizeAndRepairLatex(premise),
+    explanation: sanitizeAndRepairLatex(explanation)
   };
 }
 
 /**
- * 雲端題庫資料正規化器：確保 11 欄結構與舊版欄位偏移皆能精準對應
+ * 雲端題庫資料正規化器：確保 11 欄結構與舊版欄位偏移皆能精準對應，並杜絕殘缺選項與損壞 LaTeX
  */
 function normalizeQuestionItem(raw, conceptLookupMap) {
   if (!raw) return null;
 
+  let qid = "";
+  let cid = "";
+  let mainCat = "未分類講義";
+  let subCat = "未分類觀念";
+  let promptText = "";
+  let correctText = "";
+  let rawDistractors = "";
+  let expText = "";
+
   // 標準 11 欄轉換後結構
   if (raw.main_category !== undefined && raw.sub_category !== undefined && raw.question !== undefined) {
-    const distractorsArr = Array.isArray(raw.distractors)
-      ? raw.distractors.map(s => String(s).trim()).filter(Boolean)
-      : String(raw.distractors || "")
-          .split("|")
-          .map(s => s.trim())
-          .filter(Boolean);
-
-    return {
-      id: String(raw.id || "").trim(),
-      concept_id: String(raw.concept_id || "").trim(),
-      main_category: String(raw.main_category || "未分類講義").trim(),
-      sub_category: String(raw.sub_category || "未分類觀念").trim(),
-      question: String(raw.question || "").trim(),
-      correctAnswer: String(raw.correctAnswer || "").trim(),
-      distractors: distractorsArr,
-      explanation: String(raw.explanation || "").trim()
-    };
-  }
-
-  // 相容雲端試算表 11 欄但舊版 GAS 以 10 欄讀取之偏移映射
-  if (raw.unit !== undefined && raw.correct_val === "text") {
-    const cid = String(raw.concept_id || "").trim();
+    qid = String(raw.id || "").trim();
+    cid = String(raw.concept_id || "").trim();
+    mainCat = String(raw.main_category || "未分類講義").trim();
+    subCat = String(raw.sub_category || "未分類觀念").trim();
+    promptText = String(raw.question || "").trim();
+    correctText = String(raw.correctAnswer || "").trim();
+    rawDistractors = Array.isArray(raw.distractors) ? raw.distractors.join("|") : String(raw.distractors || "");
+    expText = String(raw.explanation || "").trim();
+  } else if (raw.unit !== undefined && raw.correct_val === "text") {
+    // 相容雲端試算表 11 欄但舊版 GAS 以 10 欄讀取之偏移映射
+    qid = String(raw.id || "").trim();
+    cid = String(raw.concept_id || "").trim();
     const linkedConcept = conceptLookupMap ? conceptLookupMap.get(cid) : null;
-    const rawPipeDistractors = String(raw.explanation || "").trim();
-    const distractorsArr = rawPipeDistractors
-      ? rawPipeDistractors
-          .split("|")
-          .map(s => s.trim())
-          .filter(Boolean)
-      : [];
-
-    const fallbackExp = linkedConcept
+    mainCat = String(raw.unit || "未分類講義").trim();
+    subCat = String(raw.prompt || "未分類觀念").trim();
+    promptText = String(raw.correct_type || "").trim();
+    correctText = String(raw.distractor_type || "").trim();
+    rawDistractors = String(raw.explanation || "").trim();
+    expText = linkedConcept
       ? `${linkedConcept.definition}${linkedConcept.premise ? " ｜ " + linkedConcept.premise : ""}`
       : "";
+  } else {
+    qid = String(raw.id || "").trim();
+    cid = String(raw.concept_id || "").trim();
+    mainCat = String(raw.main_category || raw.unit || "未分類講義").trim();
+    subCat = String(raw.sub_category || "未分類觀念").trim();
+    promptText = String(raw.question || raw.prompt || "").trim();
+    correctText = String(raw.correctAnswer || raw.correct_val || "").trim();
+    rawDistractors = Array.isArray(raw.distractors) ? raw.distractors.join("|") : String(raw.distractors || "");
+    expText = String(raw.explanation || "").trim();
+  }
 
-    return {
-      id: String(raw.id || "").trim(),
-      concept_id: cid,
-      main_category: String(raw.unit || "未分類講義").trim(),
-      sub_category: String(raw.prompt || "未分類觀念").trim(),
-      question: String(raw.correct_type || "").trim(),
-      correctAnswer: String(raw.distractor_type || "").trim(),
-      distractors: distractorsArr,
-      explanation: fallbackExp
-    };
+  // 1. 題幹與正解進行 LaTeX 修復
+  const sanitizedPrompt = sanitizeAndRepairLatex(promptText);
+  const sanitizedCorrect = sanitizeAndRepairLatex(correctText);
+
+  // 2. 檢測雲端回傳之干擾項是否包含損壞特徵 (如 "$24\text{$", "$$", 孤立標點)
+  let distractorsArr = [];
+  const hasCorruptedDistractors =
+    rawDistractors.includes("$$") ||
+    rawDistractors.includes("\\text{$") ||
+    /\|\s*[\$\\]\s*\|/.test(rawDistractors) ||
+    rawDistractors.includes("$刻 $") ||
+    rawDistractors.includes("$為 $");
+
+  if (hasCorruptedDistractors && QUESTION_DISTRACTOR_PATCHES[qid]) {
+    // 優先使用物理校正修補選項
+    distractorsArr = QUESTION_DISTRACTOR_PATCHES[qid].map(sanitizeAndRepairLatex);
+  } else {
+    // 依 | 拆分並嚴格防呆清洗
+    distractorsArr = rawDistractors
+      .split("|")
+      .map(s => s.trim())
+      .filter(s => {
+        // 排除長度過短或純標點碎片
+        if (!s || s.length <= 1) return false;
+        if (/^[\$\\\|#\s]+$/.test(s)) return false;
+        return true;
+      })
+      .map(sanitizeAndRepairLatex);
+
+    // 若拆分後過少且修補字典有對應，使用修補字典
+    if (distractorsArr.length < 3 && QUESTION_DISTRACTOR_PATCHES[qid]) {
+      distractorsArr = QUESTION_DISTRACTOR_PATCHES[qid].map(sanitizeAndRepairLatex);
+    }
   }
 
   return {
-    id: String(raw.id || "").trim(),
-    concept_id: String(raw.concept_id || "").trim(),
-    main_category: String(raw.main_category || raw.unit || "未分類講義").trim(),
-    sub_category: String(raw.sub_category || "未分類觀念").trim(),
-    question: String(raw.question || raw.prompt || "").trim(),
-    correctAnswer: String(raw.correctAnswer || raw.correct_val || "").trim(),
-    distractors: Array.isArray(raw.distractors) ? raw.distractors : [],
-    explanation: String(raw.explanation || "").trim()
+    id: qid,
+    concept_id: cid,
+    main_category: mainCat,
+    sub_category: subCat,
+    question: sanitizedPrompt,
+    correctAnswer: sanitizedCorrect,
+    distractors: distractorsArr,
+    explanation: sanitizeAndRepairLatex(expText)
   };
 }
 
@@ -255,7 +424,20 @@ async function handleLogin() {
       return;
     }
 
-    currentUser = loginRes.user || { username, name: username };
+    // 判斷管理者權限（試算表 E 欄核取方塊）
+    // 若後端回傳 isAdmin: true，或者帳號為 KUO / 郭老師，賦予管理者權限
+    const isAdmin = Boolean(
+      loginRes.user && (
+        loginRes.user.isAdmin === true ||
+        String(loginRes.user.isAdmin).toUpperCase() === "TRUE" ||
+        loginRes.user.username?.toUpperCase() === "KUO"
+      )
+    );
+
+    currentUser = {
+      ...(loginRes.user || { username, name: username }),
+      isAdmin: isAdmin
+    };
 
     // 第二階段：立刻呼叫 getInitialData 取得觀念庫、題庫與歷史紀錄
     statusEl.textContent = "☁️ 第二階段：驗證成功！正在同步雲端講義觀念庫、題庫與歷史快照...";
@@ -292,11 +474,24 @@ async function handleLogin() {
     // 更新頂部學生姓名與雲端同步狀態徽章
     const userDisplayEl = document.getElementById("user-display-name");
     const syncBadgeEl = document.getElementById("sync-status-badge");
+    const adminTabBtn = document.getElementById("tab-btn-admin");
+
     if (userDisplayEl) {
-      userDisplayEl.textContent = `👤 學生：${currentUser.name || currentUser.username}`;
+      userDisplayEl.textContent = currentUser.isAdmin
+        ? `👑 管理者：${currentUser.name || currentUser.username}`
+        : `👤 學生：${currentUser.name || currentUser.username}`;
     }
     if (syncBadgeEl) {
       syncBadgeEl.textContent = `🟢 雲端同步 (${conceptBank.length}觀念/${questionBank.length}題)`;
+    }
+
+    // 根據管理權限顯示或隱藏「🛠️ 題庫總覽」分頁按鈕
+    if (adminTabBtn) {
+      if (currentUser.isAdmin) {
+        adminTabBtn.classList.remove("hidden");
+      } else {
+        adminTabBtn.classList.add("hidden");
+      }
     }
 
     // 隱藏 #login-view，顯示 #main-app
@@ -304,13 +499,20 @@ async function handleLogin() {
     document.getElementById("main-app").classList.remove("hidden");
     statusEl.textContent = "";
 
-    // 觸發錯題動態解析、三層分類選單初始化，預設進入「📐 觀念複習」分頁
+    // 觸發錯題動態解析、三層分類選單初始化
     recalculateUnresolvedMistakes();
     initTaxonomyFilters();
     renderMistakeReviewCards();
     initRetryQuizUI();
     renderHistoryCards("6m");
-    switchTab("view-study");
+
+    // 管理者登入後直接進入「🛠️ 題庫總覽與單元檢視面板」；一般學生進入「📐 觀念複習」
+    if (currentUser.isAdmin) {
+      initAdminTaxonomyFilters();
+      switchTab("view-admin-bank");
+    } else {
+      switchTab("view-study");
+    }
   } catch (err) {
     console.error("雲端通訊異常：", err);
     statusEl.textContent = `❌ 網路或雲端連線異常：${err.message || "請稍後再試"}`;
@@ -345,6 +547,9 @@ function handleLogout() {
     statusEl.className = "login-status";
   }
 
+  const adminTabBtn = document.getElementById("tab-btn-admin");
+  if (adminTabBtn) adminTabBtn.classList.add("hidden");
+
   document.getElementById("main-app").classList.add("hidden");
   document.getElementById("login-view").classList.remove("hidden");
   closeConceptModal();
@@ -357,7 +562,7 @@ function handleLogout() {
 // [3.1] 頂部永久品牌橫幅 (#global-top-banner) 已常駐掛載於 DOM 最頂端
 
 /**
- * [3.2] 切換 6 大主要功能視圖與 1 個測驗進行中視圖
+ * [3.2] 切換 7 大主要功能視圖與 1 個測驗進行中視圖
  * @param {string} tabKey - 目標視圖 ID
  */
 function switchTab(tabKey) {
@@ -374,7 +579,8 @@ function switchTab(tabKey) {
     "view-quiz",
     "view-active-quiz",
     "view-history",
-    "view-retry"
+    "view-retry",
+    "view-admin-bank"
   ];
 
   allViews.forEach(viewId => {
@@ -396,7 +602,8 @@ function switchTab(tabKey) {
     "view-quiz": "tab-btn-quiz",
     "view-active-quiz": "tab-btn-quiz",
     "view-history": "tab-btn-history",
-    "view-retry": "tab-btn-retry"
+    "view-retry": "tab-btn-retry",
+    "view-admin-bank": "tab-btn-admin"
   };
 
   const activeBtnId = tabBtnMap[tabKey];
@@ -417,6 +624,8 @@ function switchTab(tabKey) {
     renderHistoryCards(currentHistoryFilter);
   } else if (tabKey === "view-retry") {
     initRetryQuizUI();
+  } else if (tabKey === "view-admin-bank") {
+    renderAdminQuestionList();
   }
 }
 
@@ -679,17 +888,21 @@ function renderStudyCards() {
  */
 function triggerKaTeXRender(element) {
   if (!element) return;
+  const renderOptions = {
+    delimiters: [
+      { left: "$$", right: "$$", display: true },
+      { left: "$", right: "$", display: false },
+      { left: "\\(", right: "\\)", display: false },
+      { left: "\\[", right: "\\]", display: true }
+    ],
+    throwOnError: false,
+    errorColor: "#dc2626",
+    strict: false
+  };
+
   if (typeof window.renderMathInElement === "function") {
     try {
-      window.renderMathInElement(element, {
-        delimiters: [
-          { left: "$$", right: "$$", display: true },
-          { left: "$", right: "$", display: false },
-          { left: "\\(", right: "\\)", display: false },
-          { left: "\\[", right: "\\]", display: true }
-        ],
-        throwOnError: false
-      });
+      window.renderMathInElement(element, renderOptions);
     } catch (err) {
       console.warn("KaTeX 渲染警告：", err);
     }
@@ -697,13 +910,11 @@ function triggerKaTeXRender(element) {
     // 若 CDN 腳本尚在非同步載入，延遲 150ms 重試
     setTimeout(() => {
       if (typeof window.renderMathInElement === "function") {
-        window.renderMathInElement(element, {
-          delimiters: [
-            { left: "$$", right: "$$", display: true },
-            { left: "$", right: "$", display: false }
-          ],
-          throwOnError: false
-        });
+        try {
+          window.renderMathInElement(element, renderOptions);
+        } catch (err) {
+          console.warn("KaTeX 延遲渲染警告：", err);
+        }
       }
     }, 150);
   }
@@ -839,18 +1050,39 @@ function loadQuizQuestion() {
     feedbackPanel.classList.add("hidden");
   }
 
-  // 渲染題幹
+  // 渲染題幹 (經過 LaTeX 健檢與修復)
   if (promptEl) {
-    promptEl.innerHTML = escapeHtml(q.question);
+    promptEl.innerHTML = escapeHtml(sanitizeAndRepairLatex(q.question));
     triggerKaTeXRender(promptEl);
   }
 
-  // 4 選 1 動態組裝規則：從 distractors 隨機抽取最多 3 個干擾項 + 1 個正解，隨機洗牌打散
-  const uniqueDistractors = Array.from(
-    new Set((q.distractors || []).filter(d => d && d !== q.correctAnswer))
+  // 4 選 1 動態組裝防呆規則：
+  // 1. 深度清洗與去重干擾項，排除空值、純符號、與正解相同者
+  const cleanCorrect = sanitizeAndRepairLatex(q.correctAnswer);
+  let validDistractors = Array.from(
+    new Set(
+      (q.distractors || [])
+        .map(sanitizeAndRepairLatex)
+        .filter(d => d && d !== cleanCorrect && d.length > 1 && !/^[\$\\\|#\s]+$/.test(d))
+    )
   );
-  const pickedDistractors = shuffleArray(uniqueDistractors).slice(0, 3);
-  currentFourChoices = shuffleArray([q.correctAnswer, ...pickedDistractors]);
+
+  // 2. 防呆備援：若題目自身有效干擾項少於 3 個，自動從同分類或其他題目借用合適選項補足
+  if (validDistractors.length < 3) {
+    const backupPool = questionBank
+      .filter(item => item.id !== q.id)
+      .flatMap(item => [item.correctAnswer, ...(item.distractors || [])])
+      .map(sanitizeAndRepairLatex)
+      .filter(d => d && d !== cleanCorrect && !validDistractors.includes(d) && d.length > 1 && !/^[\$\\\|#\s]+$/.test(d));
+
+    const needed = 3 - validDistractors.length;
+    const borrowed = shuffleArray(backupPool).slice(0, needed);
+    validDistractors.push(...borrowed);
+  }
+
+  // 3. 隨機選取最多 3 個干擾項，與正解合併為 4 個選項並洗牌打散
+  const pickedDistractors = shuffleArray(validDistractors).slice(0, 3);
+  currentFourChoices = shuffleArray([cleanCorrect, ...pickedDistractors].map(sanitizeAndRepairLatex));
 
   const letters = ["(A)", "(B)", "(C)", "(D)"];
   if (optionsContainer) {
@@ -1059,20 +1291,11 @@ async function finishQuiz() {
   }
 
   const scoreStr = `${correctCount} / ${totalCount}`;
-  let newSessionObj = {
-    session_id: `sess_${Date.now()}`,
-    username: currentUser ? currentUser.username : "KUO",
-    unit_title: unitTitle,
-    score: scoreStr,
-    correct_count: correctCount,
-    total_count: totalCount,
-    snapshots: [...quizAnswersRecord],
-    timestamp: new Date().toISOString()
-  };
+  const targetUsername = currentUser && currentUser.username ? currentUser.username : "KUO";
 
   try {
     const res = await callGasApi("submitQuiz", {
-      username: newSessionObj.username,
+      username: targetUsername,
       unit_title: unitTitle,
       unitTitle: unitTitle,
       score: scoreStr,
@@ -1083,28 +1306,41 @@ async function finishQuiz() {
       snapshots: quizAnswersRecord
     });
 
-    if (res && res.session) {
-      newSessionObj = normalizeHistoryItem(res.session);
-    }
+    if (res && res.success && res.session) {
+      // 雲端確認成功寫入，將標準 session 資料推入本地歷史
+      const savedSession = normalizeHistoryItem(res.session);
+      quizHistory.push(savedSession);
 
-    if (syncNotice) {
-      syncNotice.textContent =
-        "✅ 已成功同步至雲端試算表！錯題本與歷史快照已完成動態更新。";
+      // 動態更新錯題池與相關畫面
+      recalculateUnresolvedMistakes();
+      renderMistakeReviewCards();
+      initRetryQuizUI();
+      renderHistoryCards(currentHistoryFilter);
+
+      if (syncNotice) {
+        syncNotice.classList.remove("sync-error");
+        syncNotice.textContent =
+          "✅ 已成功寫入雲端 QuizHistory！錯題池與歷史快照已完成即時同步。";
+      }
+    } else {
+      // 後端回傳失敗訊息
+      const errMsg = (res && res.message) ? res.message : "雲端資料庫回傳異常";
+      console.error("雲端寫入測驗紀錄失敗：", errMsg, res);
+      if (syncNotice) {
+        syncNotice.classList.add("sync-error");
+        syncNotice.textContent = `❌ 雲端寫入失敗（${errMsg}）！本次作答未寫入試算表，請檢查後端部署。`;
+      }
+      alert(`【雲端同步失敗警告】\n測驗作答快照未能成功寫入 Google 試算表 QuizHistory！\n原因：${errMsg}\n\n為維持雲端與本機資料一致性，系統不會寫入未經確認的暫存快照。請確認 Google 試算表存取權限或重新提交。`);
     }
   } catch (err) {
-    console.error("雲端寫入測驗紀錄失敗：", err);
+    console.error("雲端連線失敗或逾時：", err);
     if (syncNotice) {
+      syncNotice.classList.add("sync-error");
       syncNotice.textContent =
-        "⚠️ 雲端同步發生短暫延遲，已先於本機記憶體完成錯題動態更新。";
+        `❌ 雲端連線異常（${err.message || "網路阻斷"}）！本次作答未成功儲存至試算表。`;
     }
+    alert(`【網路連線失敗警告】\n無法連線至雲端 API 端點。\n原因：${err.message || "網路連線中斷或逾時"}\n\n本次測驗紀錄未寫入雲端，請檢查網路連線或稍後重試。`);
   }
-
-  // 將新產生的 session 物件直接推入本地 quizHistory 陣列，並立即重新執行 [7.1] 錯題動態解析
-  quizHistory.push(newSessionObj);
-  recalculateUnresolvedMistakes();
-  renderMistakeReviewCards();
-  initRetryQuizUI();
-  renderHistoryCards(currentHistoryFilter);
 }
 
 /* ============================================================================
@@ -1459,6 +1695,158 @@ function toggleHistoryAccordion(bodyId) {
   if (!el.classList.contains("hidden")) {
     triggerKaTeXRender(el);
   }
+}
+
+/* ============================================================================
+ * [MODULE 8.0] 管理者專屬題庫檢視與單元選取面板 (Admin Question Bank Manager)
+ * ============================================================================ */
+
+/**
+ * [8.1] 初始化管理者單元分類下拉選單
+ */
+function initAdminTaxonomyFilters() {
+  const mainSelect = document.getElementById("admin-main-select");
+  if (!mainSelect) return;
+
+  const mainCategories = Array.from(
+    new Set(questionBank.map(q => q.main_category).concat(conceptBank.map(c => c.main_category)).filter(Boolean))
+  );
+
+  mainSelect.innerHTML = [
+    `<option value="ALL">全部講義 (跨單元)</option>`,
+    ...mainCategories.map(cat => `<option value="${escapeHtml(cat)}">${escapeHtml(cat)}</option>`)
+  ].join("");
+
+  handleAdminMainCategoryChange();
+}
+
+/**
+ * [8.2] 當管理者主分類變更時，動態更新第二層觀念子分類下拉選單
+ */
+function handleAdminMainCategoryChange() {
+  const mainSelect = document.getElementById("admin-main-select");
+  const subSelect = document.getElementById("admin-sub-select");
+  if (!mainSelect || !subSelect) return;
+
+  const selectedMain = mainSelect.value;
+  const filteredQuestions =
+    selectedMain === "ALL"
+      ? questionBank
+      : questionBank.filter(q => q.main_category === selectedMain);
+
+  const subCategories = Array.from(
+    new Set(filteredQuestions.map(q => q.sub_category).filter(Boolean))
+  );
+
+  subSelect.innerHTML = [
+    `<option value="ALL">全部觀念子分類 (共 ${subCategories.length} 個子單元)</option>`,
+    ...subCategories.map(sub => `<option value="${escapeHtml(sub)}">${escapeHtml(sub)}</option>`)
+  ].join("");
+
+  renderAdminQuestionList();
+}
+
+/**
+ * [8.3] 渲染管理者專屬題庫卡片清單
+ * 完整檢視該單元底下的所有題目、選項、正確答案與詳解，不需隨機抽選
+ */
+function renderAdminQuestionList() {
+  const container = document.getElementById("admin-questions-container");
+  const countBadge = document.getElementById("admin-questions-count");
+  const mainSelect = document.getElementById("admin-main-select");
+  const subSelect = document.getElementById("admin-sub-select");
+
+  if (!container) return;
+
+  const selectedMain = mainSelect ? mainSelect.value : "ALL";
+  const selectedSub = subSelect ? subSelect.value : "ALL";
+
+  const filtered = questionBank.filter(q => {
+    const matchMain = selectedMain === "ALL" || q.main_category === selectedMain;
+    const matchSub = selectedSub === "ALL" || q.sub_category === selectedSub;
+    return matchMain && matchSub;
+  });
+
+  if (countBadge) {
+    countBadge.textContent = `顯示 ${filtered.length} 題 / 題庫總計 ${questionBank.length} 題`;
+  }
+
+  if (filtered.length === 0) {
+    container.innerHTML = `
+      <div class="empty-state-box">
+        📭 所選分類目前尚無題目資料。
+      </div>
+    `;
+    return;
+  }
+
+  container.innerHTML = filtered
+    .map((q, idx) => {
+      const cleanCorrect = sanitizeAndRepairLatex(q.correctAnswer);
+      const cleanDistractors = (q.distractors || []).map(sanitizeAndRepairLatex);
+      const linkedConcept = conceptBank.find(c => c.concept_id === q.concept_id);
+      const expText =
+        q.explanation && q.explanation !== "text"
+          ? q.explanation
+          : linkedConcept
+          ? linkedConcept.definition
+          : "暫無詳解，請對照核心觀念推導。";
+
+      const distractorsHtml = cleanDistractors.length > 0
+        ? cleanDistractors
+            .map((d, dIdx) => {
+              return `
+                <div class="admin-opt-item admin-opt-distractor">
+                  <span class="admin-opt-tag">干擾項 ${dIdx + 1}</span>
+                  <span class="opt-content">${escapeHtml(d)}</span>
+                </div>
+              `;
+            })
+            .join("")
+        : `<div style="font-size: 13.5px; color: #64748b;">(無額外干擾項)</div>`;
+
+      return `
+        <div class="admin-question-card" data-question-id="${escapeHtml(q.id)}">
+          <div class="admin-card-top">
+            <div>
+              <span class="concept-cat-badge">[${escapeHtml(q.main_category)}] · ${escapeHtml(q.sub_category)}</span>
+              <strong style="margin-left: 8px; font-size: 14.5px;">題號 ${idx + 1}</strong>
+            </div>
+            <span class="concept-id-tag">題目 ID: ${escapeHtml(q.id)}</span>
+          </div>
+
+          <div class="admin-prompt-box">
+            ${escapeHtml(q.question)}
+          </div>
+
+          <div class="admin-options-grid">
+            <div class="admin-opt-item admin-opt-correct">
+              <span class="admin-opt-tag">🎯 正確選項</span>
+              <span class="opt-content">${escapeHtml(cleanCorrect)}</span>
+            </div>
+            ${distractorsHtml}
+          </div>
+
+          <div class="admin-exp-box">
+            <strong>📖 題目詳解與核心對照：</strong><br />
+            ${escapeHtml(expText)}
+          </div>
+
+          <div class="admin-card-footer">
+            <button
+              type="button"
+              class="btn-outline"
+              onclick="openConceptModal('${escapeJsStr(q.concept_id)}', '${escapeJsStr(q.sub_category)}')"
+            >
+              🔗 對照核心觀念 (${escapeHtml(q.concept_id || "無關聯")})
+            </button>
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+
+  triggerKaTeXRender(container);
 }
 
 /* ============================================================================

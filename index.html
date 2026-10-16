@@ -114,6 +114,9 @@
             🔥 錯題特訓
             <span id="badge-retry-count" class="tab-counter-badge">0</span>
           </button>
+          <button type="button" id="tab-btn-admin" class="nav-tab-btn admin-tab-btn hidden" onclick="switchTab('view-admin-bank')">
+            🛠️ 題庫總覽
+          </button>
         </nav>
       </div>
 
@@ -481,6 +484,55 @@
             </div>
           </div>
         </div>
+      </article>
+
+      <!-- ==================== [視圖 8] 🛠️ 管理者題庫總覽與單元檢視面板 (#view-admin-bank) ==================== -->
+      <article id="view-admin-bank" class="app-view hidden">
+        <div class="section-card admin-header-card">
+          <div class="taxonomy-header">
+            <div>
+              <div class="admin-badge-row">
+                <span class="admin-role-badge">👑 管理者出題控制面板</span>
+                <span id="admin-questions-count" class="count-pill">顯示 0 題 / 題庫總計 0 題</span>
+              </div>
+              <h2 class="section-title">🛠️ 雲端題庫總覽與單元檢視</h2>
+              <p class="section-subtitle">
+                管理者專屬檢視：直接檢閱各單元題幹、選項、正確答案與詳細解析；可自由依單元篩選或隨時切換至實測模式
+              </p>
+            </div>
+            <div class="admin-header-actions">
+              <button type="button" class="btn-primary" onclick="switchTab('view-quiz')">
+                ⚡ 前往快速測驗
+              </button>
+              <button type="button" class="btn-outline" onclick="switchTab('view-study')">
+                📐 前往觀念複習
+              </button>
+            </div>
+          </div>
+
+          <!-- 單元篩選控制列 -->
+          <div class="taxonomy-controls">
+            <div class="taxonomy-layer">
+              <div class="admin-filter-grid">
+                <div class="admin-filter-item">
+                  <label for="admin-main-select" class="layer-label">第一層｜選擇講義主分類：</label>
+                  <select id="admin-main-select" class="form-select" onchange="handleAdminMainCategoryChange()">
+                    <option value="ALL">全部講義 (跨單元)</option>
+                  </select>
+                </div>
+                <div class="admin-filter-item">
+                  <label for="admin-sub-select" class="layer-label">第二層｜選擇觀念子分類：</label>
+                  <select id="admin-sub-select" class="form-select" onchange="renderAdminQuestionList()">
+                    <option value="ALL">全部觀念子分類</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 題目列表清單 -->
+        <div id="admin-questions-container" class="cards-stack"></div>
       </article>
     </section>
   </main>
