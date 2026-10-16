@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>郭志雄物理 - 物理概念與公式自測系統</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>⚛️</text></svg>" />
+  <!-- KaTeX v0.16.8 數學公式渲染引擎 CDN -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.css" crossorigin="anonymous" />
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.js" crossorigin="anonymous"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/contrib/auto-render.min.js" crossorigin="anonymous"></script>
+  <!-- 系統主樣式表 -->
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- [MODULE 3.1] 頂部永久品牌橫幅 (Global Top Banner) - 登入前與登入後皆常駐於頁面最上方 -->
+  <header id="global-top-banner" class="global-top-banner">
+    <div class="banner-inner">
+      <div class="banner-brand">
+        <span class="banner-icon" aria-hidden="true">⚛️</span>
+        <h1 class="banner-title">郭志雄物理</h1>
+        <span class="banner-subtitle">物理概念與觀念快速測驗系統</span>
+      </div>
+      <div class="banner-promise-badge">
+        🎓 2025年入學 科學班／數理資優班專屬 ｜ 📌 此網頁將至少維護至 2029 年 8 月（陪伴至高三分科測驗結束）
+      </div>
+    </div>
+  </header>
+
+  <!-- 系統主容器 -->
+  <main class="app-wrapper">
+    <!-- ==================== 登入視圖 (#login-view) ==================== -->
+    <section id="login-view" class="login-section">
+      <div class="login-card">
+        <div class="login-header">
+          <div class="login-logo-badge">🔒 物理學習系統登入</div>
+          <h2 class="login-card-title">歡迎進入物理概念與公式自測系統</h2>
+          <p class="login-card-desc">
+            伴隨學習軌跡，永遠溫故知新
+          </p>
+        </div>
+
+        <div class="login-form">
+          <div class="form-group">
+            <label for="login-username" class="form-label">學生帳號 (Username)</label>
+            <input
+              type="text"
+              id="login-username"
+              class="form-input"
+              placeholder="請輸入專屬帳號 (例如：KUO)"
+              autocomplete="username"
+              onkeydown="handleLoginKeydown(event)"
+            />
+          </div>
+
+          <div class="form-group">
+            <label for="login-password" class="form-label">登入密碼 (Password)</label>
+            <input
+              type="password"
+              id="login-password"
+              class="form-input"
+              placeholder="請輸入密碼"
+              autocomplete="current-password"
+              onkeydown="handleLoginKeydown(event)"
+            />
+          </div>
+
+          <div id="login-status" class="login-status" role="status" aria-live="polite"></div>
+
+          <button type="button" id="login-btn" class="btn-primary btn-login" onclick="handleLogin()">
+            登入系統
+          </button>
+        </div>
+
+        <div class="login-footer-hint">
+          💡 提示：支援鍵盤 <code>Enter</code> 鍵快速登入；登入後將自動同步最新講義觀念與歷史錯題紀錄。
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== 主應用程式視圖 (#main-app) ==================== -->
+    <section id="main-app" class="main-app hidden">
+      <!-- 頂部學生狀態與導航列 -->
+      <div class="top-control-bar">
+        <div class="user-status-bar">
+          <div class="user-info-group">
+            <span id="user-display-name" class="user-badge">👤 學生：載入中...</span>
+            <span id="sync-status-badge" class="sync-badge">🟢 雲端同步 (0觀念/0題)</span>
+          </div>
+          <button type="button" id="logout-btn" class="btn-outline-sm" onclick="handleLogout()">
+            🚪 登出系統
+          </button>
+        </div>
+
+        <!-- 6 大主要功能導航列 -->
+        <nav class="nav-tabs" aria-label="主要功能導航">
+          <button type="button" id="tab-btn-guide" class="nav-tab-btn" onclick="switchTab('view-guide')">
+            📖 網站說明
+          </button>
+          <button type="button" id="tab-btn-study" class="nav-tab-btn active" onclick="switchTab('view-study')">
+            📐 觀念複習
+          </button>
+          <button type="button" id="tab-btn-review" class="nav-tab-btn" onclick="switchTab('view-review')">
+            🦉 錯題整理
+            <span id="badge-review-count" class="tab-counter-badge">0</span>
+          </button>
+          <button type="button" id="tab-btn-quiz" class="nav-tab-btn" onclick="switchTab('view-quiz')">
+            ⚡ 快速測驗
+          </button>
+          <button type="button" id="tab-btn-history" class="nav-tab-btn" onclick="switchTab('view-history')">
+            📊 歷史快照
+          </button>
+          <button type="button" id="tab-btn-retry" class="nav-tab-btn" onclick="switchTab('view-retry')">
+            🔥 錯題特訓
+            <span id="badge-retry-count" class="tab-counter-badge">0</span>
+          </button>
+        </nav>
+      </div>
+
+      <!-- ==================== [視圖 1] 📖 網站說明 (#view-guide) ==================== -->
+      <article id="view-guide" class="app-view hidden">
+        <div class="section-card guide-hero-card">
+          <h2 class="section-title">📖 郭志雄物理｜科學班／數理資優班超修學習指南</h2>
+          <p class="section-lead">
+            本系統專為 <strong>2025 年入學（國二超修高中物理，一路銜接至 2029 年 8 月高三分科測驗）</strong> 的同學量身打造。透過「肯定句推導鏈」建立嚴謹的物理直覺，並以「雲端動態錯題消除」確保每一個觀念漏洞在段考與大考前徹底清零。
+          </p>
+
+          <div class="guide-grid">
+            <div class="guide-feature-box">
+              <div class="guide-feature-num">01</div>
+              <h3>✦ 架構鏈學習法</h3>
+              <p>
+                物理絕非死背公式。在「📐 觀念複習」中，每張觀念卡片皆以暖黃色肯定句推導框呈現核心物理定義與向量微積分關係，搭配「觀念要點」與「核心對照」，幫助同學從基本定義出發，建立嚴謹且完整的物理架構鏈。
+              </p>
+            </div>
+
+            <div class="guide-feature-box">
+              <div class="guide-feature-num">02</div>
+              <h3>🎯 兩年四個月超修與長線規劃</h3>
+              <p>
+                雖然上課期間從國二開始、至同學高一為止，但課程範圍涵蓋至高三選修物理。課程時長約兩年四個月，而系統將持續維護至 2029 年 8 月分科測驗結束。確保同學們即使從本班畢業，也能隨時回來回顧所有的基礎物理觀念，完整保存四年來的每一次練習快照，隨時回顧過往盲點。
+              </p>
+            </div>
+
+            <div class="guide-feature-box">
+              <div class="guide-feature-num">03</div>
+              <h3>⚡ 4 選 1 選擇題與 20 秒限時反應</h3>
+              <p>
+                題目的結構為 4 選 1 的選擇題，搭配 20 秒限時反應。每次進入快速測驗，系統皆會隨機抽題與洗牌選項，訓練直覺反應與解題節奏。
+              </p>
+            </div>
+
+            <div class="guide-feature-box">
+              <div class="guide-feature-num">04</div>
+              <h3>🦉 雲端錯題動態消除與歷程記錄</h3>
+              <p>
+                你的每一次回答過程與作答歷程都會被安全地儲存在系統記錄當中。只要你的錯題在後續進一步答對，就會被自動消除；搭配錯題特訓與歷史快照，讓你的觀念漏洞在段考與大考前徹底清零。
+              </p>
+            </div>
+          </div>
+
+          <div class="guide-action-bar">
+            <button type="button" class="btn-primary" onclick="switchTab('view-study')">
+              📐 前往觀念複習
+            </button>
+            <button type="button" class="btn-secondary" onclick="switchTab('view-quiz')">
+              ⚡ 立即開始快速測驗
+            </button>
+          </div>
+        </div>
+      </article>
+
+      <!-- ==================== [視圖 2] 📐 觀念複習 (#view-study) ==================== -->
+      <article id="view-study" class="app-view">
+        <div class="section-card filter-control-card">
+          <div class="taxonomy-header">
+            <div>
+              <h2 class="section-title">📐 講義三層樹狀分類與肯定句觀念複習</h2>
+              <p class="section-subtitle">依講義主分類與觀念子分類篩選，精讀每條核心肯定句推導與公式對照</p>
+            </div>
+            <span id="study-count-summary" class="count-pill">顯示 0 張觀念卡</span>
+          </div>
+
+          <div class="taxonomy-controls">
+            <!-- 第一層：主分類下拉選單 -->
+            <div class="taxonomy-layer">
+              <label for="study-main-select" class="layer-label">第一層｜選擇講義主分類：</label>
+              <select id="study-main-select" class="form-select" onchange="handleStudyMainCategoryChange()">
+                <option value="ALL">全部講義 (跨單元)</option>
+              </select>
+            </div>
+
+            <!-- 第二層：子分類核取方塊清單 -->
+            <div class="taxonomy-layer">
+              <div class="layer-header-row">
+                <span class="layer-label">第二層｜勾選觀念子分類（sub_category）：</span>
+                <div class="quick-check-actions">
+                  <button type="button" class="btn-chip" onclick="toggleAllSubCategories('study', true)">全選子分類</button>
+                  <button type="button" class="btn-chip" onclick="toggleAllSubCategories('study', false)">全部取消</button>
+                </div>
+              </div>
+              <div id="study-sub-grid" class="sub-category-grid"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 第三層：具體觀念推導卡片列表 -->
+        <div id="study-cards-container" class="cards-stack"></div>
+      </article>
+
+      <!-- ==================== [視圖 3] 🦉 錯題整理 (#view-review) ==================== -->
+      <article id="view-review" class="app-view hidden">
+        <div class="section-card">
+          <div class="taxonomy-header">
+            <div>
+              <h2 class="section-title">🦉 待消滅錯題整理本</h2>
+              <p class="section-subtitle">
+                以下為根據雲端作答歷史動態解析出「最新一次作答仍為錯誤」的題目。點擊「🔗 對照核心觀念」可立即彈出對應講義推導卡！
+              </p>
+            </div>
+            <button type="button" class="btn-primary" onclick="switchTab('view-retry')">
+              🔥 前往錯題特訓消滅錯題
+            </button>
+          </div>
+        </div>
+
+        <div id="review-cards-container" class="cards-stack"></div>
+      </article>
+
+      <!-- ==================== [視圖 4] ⚡ 快速測驗設定 (#view-quiz) ==================== -->
+      <article id="view-quiz" class="app-view hidden">
+        <div class="section-card">
+          <div class="taxonomy-header">
+            <div>
+              <h2 class="section-title">⚡ 快速測驗範圍與題數設定</h2>
+              <p class="section-subtitle">勾選欲檢測的講義與觀念子分類，系統將動態組裝 4 選 1 選項並啟動每題 20 秒限時挑戰</p>
+            </div>
+            <span id="quiz-available-count" class="count-pill">可用題庫：0 題</span>
+          </div>
+
+          <div class="taxonomy-controls">
+            <!-- 第一層：主分類下拉選單 -->
+            <div class="taxonomy-layer">
+              <label for="quiz-main-select" class="layer-label">第一層｜選擇測驗講義主分類：</label>
+              <select id="quiz-main-select" class="form-select" onchange="handleQuizMainCategoryChange()">
+                <option value="ALL">全部講義 (跨單元)</option>
+              </select>
+            </div>
+
+            <!-- 第二層：子分類核取方塊清單 -->
+            <div class="taxonomy-layer">
+              <div class="layer-header-row">
+                <span class="layer-label">第二層｜勾選欲測驗之觀念子分類（sub_category）：</span>
+                <div class="quick-check-actions">
+                  <button type="button" class="btn-chip" onclick="toggleAllSubCategories('quiz', true)">全選子分類</button>
+                  <button type="button" class="btn-chip" onclick="toggleAllSubCategories('quiz', false)">全部取消</button>
+                </div>
+              </div>
+              <div id="quiz-sub-grid" class="sub-category-grid"></div>
+            </div>
+
+            <!-- 題數選擇器 -->
+            <div class="taxonomy-layer">
+              <span class="layer-label">第三層｜選擇測驗題數規模：</span>
+              <div class="quiz-count-selector" role="radiogroup" aria-label="測驗題數選擇">
+                <label class="radio-pill-label active" id="quiz-count-label-5">
+                  <input
+                    type="radio"
+                    name="standard-quiz-count"
+                    value="5"
+                    checked
+                    onchange="updateQuizCountSelectionUI()"
+                  />
+                  <span>5 題（小範圍快速檢測）</span>
+                </label>
+                <label class="radio-pill-label" id="quiz-count-label-10">
+                  <input
+                    type="radio"
+                    name="standard-quiz-count"
+                    value="10"
+                    onchange="updateQuizCountSelectionUI()"
+                  />
+                  <span>10 題（大範圍段考複習）</span>
+                </label>
+              </div>
+            </div>
+          </div>
+
+          <div class="quiz-launch-bar">
+            <button type="button" id="start-quiz-btn" class="btn-primary btn-lg" onclick="initiateStandardQuiz()">
+              ⚡ 開始限時自我測驗
+            </button>
+          </div>
+        </div>
+      </article>
+
+      <!-- ==================== [視圖 5] 測驗進行中視圖 (#view-active-quiz) ==================== -->
+      <article id="view-active-quiz" class="app-view hidden">
+        <!-- 作答進行中卡片 -->
+        <div id="active-question-card" class="section-card quiz-active-card">
+          <div class="quiz-top-meta">
+            <div class="quiz-meta-left">
+              <span id="quiz-mode-badge" class="mode-badge">⚡ 標準快速測驗</span>
+              <span id="quiz-category-badge" class="concept-cat-badge">單元分類</span>
+            </div>
+            <div class="quiz-meta-right">
+              <span id="quiz-progress-text" class="quiz-progress-pill">第 1 / 5 題</span>
+              <span id="timer-text" class="timer-pill">⏱️ 20 秒</span>
+            </div>
+          </div>
+
+          <!-- 20 秒倒數進度條 -->
+          <div class="timer-bar-track" aria-hidden="true">
+            <div id="timer-bar" class="timer-bar-fill" style="width: 100%;"></div>
+          </div>
+
+          <!-- 題目題幹 (18.5px, 粗體, 行高 1.6) -->
+          <div id="quiz-prompt" class="quiz-prompt-box"></div>
+
+          <!-- 4 選 1 選項按鈕區 -->
+          <div id="quiz-options-container" class="quiz-options-list"></div>
+
+          <!-- 作答即時回饋列 -->
+          <div id="quiz-feedback-panel" class="quiz-feedback-panel hidden">
+            <div id="quiz-feedback-header" class="feedback-header"></div>
+            <div id="quiz-feedback-body" class="feedback-body"></div>
+            <div class="feedback-actions">
+              <button type="button" id="quiz-feedback-concept-btn" class="btn-outline">
+                🔗 對照核心觀念
+              </button>
+              <button type="button" id="next-question-btn" class="btn-primary" onclick="goToNextQuestion()">
+                下一題 ➔
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 測驗結算成果面板 -->
+        <div id="quiz-result-panel" class="section-card quiz-result-card hidden">
+          <div class="result-header">
+            <div class="result-icon" id="result-trophy-icon">🏆</div>
+            <h2 class="result-title" id="result-title-text">測驗完成！</h2>
+            <p class="result-unit" id="result-unit-text"></p>
+          </div>
+
+          <div class="result-score-box">
+            <div class="score-stat">
+              <span class="score-label">本次答對題數</span>
+              <span class="score-value" id="result-score-fraction">0 / 0</span>
+            </div>
+            <div class="score-stat">
+              <span class="score-label">答對率</span>
+              <span class="score-value" id="result-score-percent">0%</span>
+            </div>
+            <div class="score-stat">
+              <span class="score-label">平均作答耗時</span>
+              <span class="score-value" id="result-avg-time">0.0 秒</span>
+            </div>
+          </div>
+
+          <div id="result-sync-notice" class="result-sync-notice">
+            ⏳ 正在將作答快照寫入雲端試算表並更新錯題動態消除池...
+          </div>
+
+          <div class="result-actions">
+            <button type="button" class="btn-primary" onclick="switchTab('view-review')">
+              🦉 檢視待消滅錯題本
+            </button>
+            <button type="button" class="btn-secondary" onclick="switchTab('view-history')">
+              📊 查看歷史作答快照
+            </button>
+            <button type="button" class="btn-outline" onclick="switchTab('view-quiz')">
+              ⚡ 再測驗一回
+            </button>
+          </div>
+        </div>
+      </article>
+
+      <!-- ==================== [視圖 6] 📊 歷史快照 (#view-history) ==================== -->
+      <article id="view-history" class="app-view hidden">
+        <div class="section-card">
+          <div class="taxonomy-header">
+            <div>
+              <h2 class="section-title">📊 雲端測驗歷史快照與區間檢索</h2>
+              <p class="section-subtitle">點擊任一筆測驗紀錄卡片即可展開檢視當時每一題的選項快照、耗時與核心觀念對照</p>
+            </div>
+            <span id="history-count-summary" class="count-pill">共 0 筆紀錄</span>
+          </div>
+
+          <!-- 4 個快速時間區間篩選按鈕 -->
+          <div class="history-filter-bar" role="group" aria-label="歷史紀錄時間區間篩選">
+            <button
+              type="button"
+              id="hist-filter-6m"
+              class="filter-range-btn active"
+              onclick="renderHistoryCards('6m')"
+            >
+              🗓️ 近 6 個月內
+            </button>
+            <button
+              type="button"
+              id="hist-filter-6m-1y"
+              class="filter-range-btn"
+              onclick="renderHistoryCards('6m-1y')"
+            >
+              ⏳ 半年前 ～ 一年前
+            </button>
+            <button
+              type="button"
+              id="hist-filter-1y+"
+              class="filter-range-btn"
+              onclick="renderHistoryCards('1y+')"
+            >
+              🏛️ 一年以前
+            </button>
+            <button
+              type="button"
+              id="hist-filter-all"
+              class="filter-range-btn"
+              onclick="renderHistoryCards('all')"
+            >
+              📚 全部歷史紀錄
+            </button>
+          </div>
+        </div>
+
+        <div id="history-cards-container" class="cards-stack"></div>
+      </article>
+
+      <!-- ==================== [視圖 7] 🔥 錯題特訓 (#view-retry) ==================== -->
+      <article id="view-retry" class="app-view hidden">
+        <div class="section-card retry-hero-card">
+          <div class="retry-badge-top">🔥 動態錯題消滅系統</div>
+          <h2 class="section-title">🔥 錯題特訓消滅戰</h2>
+          <p class="section-lead">
+            系統已自動從你的雲端歷史紀錄中篩選出尚未克服的錯題。在特訓中只要<strong>成功答對該題</strong>，雲端紀錄更新後即會自動將該題從錯題池中永久消除！
+          </p>
+
+          <div class="retry-status-panel">
+            <div class="retry-counter-circle">
+              <span id="retry-mistake-count" class="retry-big-num">0</span>
+              <span class="retry-unit-label">題待消滅</span>
+            </div>
+
+            <div class="retry-config-col">
+              <div class="layer-label">選擇本次特訓抽題數量上限：</div>
+              <div class="quiz-count-selector" role="radiogroup" aria-label="特訓題數選擇">
+                <label class="radio-pill-label active" id="retry-count-label-5">
+                  <input
+                    type="radio"
+                    name="retry-quiz-count"
+                    value="5"
+                    checked
+                    onchange="updateRetryCountSelectionUI()"
+                  />
+                  <span>最多抽取 5 題特訓</span>
+                </label>
+                <label class="radio-pill-label" id="retry-count-label-10">
+                  <input
+                    type="radio"
+                    name="retry-quiz-count"
+                    value="10"
+                    onchange="updateRetryCountSelectionUI()"
+                  />
+                  <span>最多抽取 10 題特訓</span>
+                </label>
+              </div>
+
+              <div id="retry-empty-hint" class="retry-empty-hint hidden">
+                🎉 太棒了！目前沒有任何待消滅的錯題，請前往「⚡ 快速測驗」挑戰更多單元。
+              </div>
+
+              <div class="retry-actions-row">
+                <button type="button" id="start-retry-btn" class="btn-primary btn-lg" onclick="initiateRetryQuiz()">
+                  🔥 開始錯題特訓
+                </button>
+                <button type="button" class="btn-outline" onclick="switchTab('view-review')">
+                  🦉 先回錯題整理複習
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </article>
+    </section>
+  </main>
+
+  <!-- ==================== [MODULE 3.3] 跨視圖「對照核心觀念 (concept_id)」居中模態彈窗 ==================== -->
+  <div id="concept-modal-backdrop" class="modal-backdrop hidden" onclick="handleModalBackdropClick(event)">
+    <div id="concept-modal" class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="concept-modal-heading">
+      <div class="modal-header">
+        <h3 id="concept-modal-heading" class="modal-title">🔗 核心觀念與肯定句推導對照</h3>
+        <button type="button" id="concept-modal-close" class="modal-close-btn" onclick="closeConceptModal()" aria-label="關閉視窗">
+          ✕
+        </button>
+      </div>
+      <div id="concept-modal-body" class="modal-body"></div>
+      <div class="modal-footer">
+        <button type="button" class="btn-primary" onclick="closeConceptModal()">
+          ✓ 我已讀懂觀念，關閉視窗
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 系統前端核心商業邏輯 -->
+  <script src="app.js"></script>
+</body>
+</html>
