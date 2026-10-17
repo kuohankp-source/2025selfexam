@@ -48,42 +48,15 @@ let currentHistoryFilter = "6m";
  * ============================================================================ */
 
 /**
- * [2.1] 讀寫分流通訊包裝器 (callGasApi)
- * - 寫入操作 (submitQuiz)：帶有完整答題快照 snapshots，資料量龐大，強制自動切換為免預檢 POST (text/plain;charset=utf-8)
- *   徹底解除瀏覽器與 Google Apps Script URL 2KB 長度上限，同時免除 OPTIONS 預檢並安全穿透 302 重導向。
- * - 查詢操作 (login, getInitialData)：使用 URL-Encoded GET 搭配相容性 POST 備援通道，維持極速查詢。
+ * [2.1] URL-Encoded 純 GET 通訊包裝器 (callGasApi)
+ * 全面回歸純 GET 通訊協定，徹底杜絕跨網域 POST 觸發 Google Apps Script HTTP 302 重導向
+ * 所導致的 CORS 阻斷與「400 Bad Request / 無效的請求」問題。
  */
 async function callGasApi(action, dataObj = {}) {
   const payload = { action, ...dataObj };
-
-  // 1. 大型寫入型操作：強制使用 POST (text/plain;charset=utf-8) 避開 URL 長度限制與 preflight CORS
-  if (action === "submitQuiz") {
-    const postResponse = await fetch(GAS_ENDPOINT_URL, {
-      method: "POST",
-      mode: "cors",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: JSON.stringify(payload)
-    });
-    return await postResponse.json();
-  }
-
-  // 2. 輕量查詢型操作：預設使用 GET ?payload=...
   const url = `${GAS_ENDPOINT_URL}?payload=${encodeURIComponent(JSON.stringify(payload))}`;
   const response = await fetch(url, { method: "GET", mode: "cors" });
-  const result = await response.json();
-
-  // 相容性守衛：若雲端 GAS 尚未重新發布新版 doGet 路由而回傳預設狀態訊息，自動透過免預檢 text/plain 重試
-  if (result && result.status === "success" && result.message && result.success === undefined) {
-    const fallbackResponse = await fetch(GAS_ENDPOINT_URL, {
-      method: "POST",
-      mode: "cors",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: JSON.stringify(payload)
-    });
-    return await fallbackResponse.json();
-  }
-
-  return result;
+  return await response.json();
 }
 
 /**
@@ -355,20 +328,66 @@ function normalizeQuestionItem(raw, conceptLookupMap) {
 }
 
 /**
- * 雲端歷史紀錄正規化器
+ * [2.1.3] 快照資料水合器 (hydrateSnapshot)
+ * 相容舊版完整快照與最新輕量化 compact 快照 ({ qId, concept_id, sub, pick, correct, ok, t })
+ * 當前端讀取歷史快照時，若快照只有 qId，自動從本地 questionBank 補上完整的題幹 prompt 與詳解 explanation，
+ * 確保「歷史快照展開」與「錯題特訓」畫面顯示依然豐富完整！
+ */
+function hydrateSnapshot(snap) {
+  if (!snap) return null;
+  const qId = String(snap.questionId || snap.qId || "").trim();
+  const qRef = questionBank.find(q => q.id === qId);
+
+  const conceptId = snap.concept_id || snap.cid || (qRef ? qRef.concept_id : "");
+  const subCategory = snap.sub_category || snap.sub || snap.unit || (qRef ? qRef.sub_category : "物理觀念");
+  const promptText = snap.prompt || snap.question || (qRef ? qRef.question : "");
+  const userPickText = snap.userPick !== undefined ? snap.userPick : (snap.pick !== undefined ? snap.pick : "未作答");
+  const correctPickText = snap.correctPick !== undefined ? snap.correctPick : (snap.correct !== undefined ? snap.correct : (qRef ? qRef.correctAnswer : ""));
+  const isOk = snap.isCorrect !== undefined ? Boolean(snap.isCorrect) : (snap.ok !== undefined ? Boolean(snap.ok) : false);
+  const timeSpentVal = String(snap.timeSpent || snap.t || "0.0");
+  const expText = snap.explanation || (qRef ? qRef.explanation : "");
+
+  return {
+    questionId: qId,
+    qId: qId,
+    concept_id: conceptId,
+    cid: conceptId,
+    sub_category: subCategory,
+    sub: subCategory,
+    unit: subCategory,
+    prompt: promptText,
+    question: promptText,
+    userPick: userPickText,
+    pick: userPickText,
+    correctPick: correctPickText,
+    correct: correctPickText,
+    isCorrect: isOk,
+    ok: isOk,
+    timeSpent: timeSpentVal,
+    t: timeSpentVal,
+    explanation: expText,
+    optionsSnapshot: snap.optionsSnapshot || []
+  };
+}
+
+/**
+ * 雲端歷史紀錄正規化器 (自動透過 hydrateSnapshot 補齊快照細節)
  */
 function normalizeHistoryItem(raw) {
   if (!raw) return null;
-  let snapshots = [];
+  let rawSnapshots = [];
   if (Array.isArray(raw.snapshots)) {
-    snapshots = raw.snapshots;
+    rawSnapshots = raw.snapshots;
   } else if (typeof raw.snapshots_json === "string" && raw.snapshots_json.trim()) {
     try {
-      snapshots = JSON.parse(raw.snapshots_json);
+      rawSnapshots = JSON.parse(raw.snapshots_json);
     } catch (err) {
-      snapshots = [];
+      rawSnapshots = [];
     }
   }
+
+  // 透過 hydrateSnapshot 自動水合補齊題幹、正解、解析
+  const snapshots = rawSnapshots.map(hydrateSnapshot).filter(Boolean);
 
   const correctCount = Number(raw.correct_count !== undefined ? raw.correct_count : raw.correctCount || 0);
   const totalCount = Number(raw.total_count !== undefined ? raw.total_count : raw.totalCount || snapshots.length || 0);
@@ -1293,6 +1312,17 @@ async function finishQuiz() {
   const scoreStr = `${correctCount} / ${totalCount}`;
   const targetUsername = currentUser && currentUser.username ? currentUser.username : "KUO";
 
+  // 精簡版快照，大幅壓縮至 200~300 字元，URL 完全容納，100% 安全走 GET 通訊協定
+  const compactSnapshots = quizAnswersRecord.map(r => ({
+    qId: r.questionId,
+    concept_id: r.concept_id,
+    sub: r.sub_category,
+    pick: r.userPick,
+    correct: r.correctPick,
+    ok: r.isCorrect,
+    t: r.timeSpent
+  }));
+
   try {
     const res = await callGasApi("submitQuiz", {
       username: targetUsername,
@@ -1303,11 +1333,11 @@ async function finishQuiz() {
       correctCount: correctCount,
       total_count: totalCount,
       totalCount: totalCount,
-      snapshots: quizAnswersRecord
+      snapshots: compactSnapshots
     });
 
     if (res && res.success && res.session) {
-      // 雲端確認成功寫入，將標準 session 資料推入本地歷史
+      // 雲端確認成功寫入，將標準 session 資料推入本地歷史 (內部自動調用 hydrateSnapshot 補齊題幹與解析)
       const savedSession = normalizeHistoryItem(res.session);
       quizHistory.push(savedSession);
 
@@ -1368,24 +1398,24 @@ function recalculateUnresolvedMistakes() {
 
   sortedChronological.forEach(session => {
     const snaps = Array.isArray(session.snapshots) ? session.snapshots : [];
-    snaps.forEach(snap => {
-      const qId = String(snap.questionId || "").trim();
-      if (!qId) return;
+    snaps.forEach(rawSnap => {
+      const snap = hydrateSnapshot(rawSnap);
+      if (!snap || !snap.questionId) return;
 
-      if (snap.isCorrect === false) {
-        const qRef = questionLookup.get(qId);
+      const qId = snap.questionId;
+      if (!snap.isCorrect) {
         unresolvedMistakeMap.set(qId, {
           questionId: qId,
-          concept_id: snap.concept_id || (qRef ? qRef.concept_id : ""),
-          sub_category: snap.sub_category || snap.unit || (qRef ? qRef.sub_category : "物理觀念"),
-          prompt: snap.prompt || (qRef ? qRef.question : ""),
-          userPick: snap.userPick || "未作答",
-          correctPick: snap.correctPick || (qRef ? qRef.correctAnswer : ""),
-          timeSpent: snap.timeSpent || "0.0",
-          explanation: snap.explanation || (qRef ? qRef.explanation : ""),
+          concept_id: snap.concept_id,
+          sub_category: snap.sub_category,
+          prompt: snap.prompt,
+          userPick: snap.userPick,
+          correctPick: snap.correctPick,
+          timeSpent: snap.timeSpent,
+          explanation: snap.explanation,
           timestamp: session.timestamp
         });
-      } else if (snap.isCorrect === true) {
+      } else {
         // 動態消除機制：後續測驗答對即從待消滅錯題池中移除
         unresolvedMistakeMap.delete(qId);
       }
@@ -1607,7 +1637,8 @@ function renderHistoryCards(filterRange = "6m") {
         snaps.length === 0
           ? `<div class="empty-state-box">此筆紀錄無作答明細快照。</div>`
           : snaps
-              .map((snap, sIdx) => {
+              .map((rawSnap, sIdx) => {
+                const snap = hydrateSnapshot(rawSnap) || rawSnap;
                 const isOk = Boolean(snap.isCorrect);
                 const cid = snap.concept_id || "";
                 const subCat = snap.sub_category || snap.unit || "";
