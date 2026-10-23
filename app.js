@@ -657,6 +657,7 @@ async function handleLogin() {
     }
     const adminLogTabBtn = document.getElementById("tab-btn-admin-log");
     if (adminLogTabBtn) adminLogTabBtn.classList.toggle("hidden", !currentUser.isAdmin);
+    applyTopBanner(loginRes.banner, currentUser.isAdmin);
     const accountsTabBtn = document.getElementById("tab-btn-admin-accounts");
     if (accountsTabBtn) accountsTabBtn.classList.toggle("hidden", !currentUser.isAdmin);
 
@@ -725,6 +726,7 @@ function handleLogout() {
   if (adminLogTabBtn) adminLogTabBtn.classList.add("hidden");
   adminLogData = null;
   adminLogInitialized = false;
+  applyTopBanner("", false);
   const accountsTabBtn = document.getElementById("tab-btn-admin-accounts");
   if (accountsTabBtn) accountsTabBtn.classList.add("hidden");
   accountsData = null;
@@ -2528,6 +2530,22 @@ async function showStudentDetail(username) {
   } catch (err) {
     console.error(err);
     el.innerHTML = `<div class="empty-state-box">❌ 讀取失敗：${escapeHtml(err.message || "請稍後再試")}</div>`;
+  }
+}
+
+/* ============================================================================
+ * [MODULE 9.5] 頂部橫幅：登入前只顯示網站名稱並置中；登入後依班別顯示說明文字
+ * ============================================================================ */
+function applyTopBanner(text, isAdmin) {
+  const badge = document.getElementById("cohort-banner-badge");
+  const inner = document.getElementById("banner-inner");
+  const content = isAdmin ? "👑 管理者模式" : String(text || "").trim();
+  if (badge) {
+    badge.textContent = content;
+    badge.classList.toggle("hidden", !content);
+  }
+  if (inner) {
+    inner.style.justifyContent = content ? "" : "center";
   }
 }
 
