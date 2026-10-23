@@ -20,8 +20,7 @@
  * ============================================================================ */
 
 // [1.1] API 端點常數 GAS_ENDPOINT_URL
-const GAS_ENDPOINT_URL =
-  "https://script.google.com/macros/s/AKfycbzzbQclY5NaPIP_8sQHDPoV8w76vdwnoDHENhzNGzN08FwJMXqFHiCCV8ABaBfhz-CyxA/exec";
+// v3.2.3 起改放在 config.js（index.html 會先載入它），更新 app.js 時不必再修改網址
 
 // [1.2] 全域資料容器
 let currentUser = null;
@@ -57,6 +56,9 @@ let currentHistoryFilter = "6m";
  * 所導致的 CORS 阻斷與「400 Bad Request / 無效的請求」問題。
  */
 async function callGasApi(action, dataObj = {}) {
+  if (typeof GAS_ENDPOINT_URL === "undefined" || !GAS_ENDPOINT_URL) {
+    throw new Error("找不到後端網址設定（config.js），請聯絡老師");
+  }
   const payload = { action, ...dataObj };
   if (sessionToken && action !== "login") {
     payload.token = sessionToken;
@@ -643,8 +645,7 @@ async function handleLogin() {
         : `👤 學生：${currentUser.name || currentUser.username}`;
     }
     if (syncBadgeEl) {
-      const totals = catalogTotals();
-      syncBadgeEl.textContent = `🟢 雲端同步 (${catalog.length}本講義/${totals.concepts}觀念/${totals.questions}題)`;
+      syncBadgeEl.textContent = "🟢 雲端同步";
     }
 
     // 根據管理權限顯示或隱藏「🛠️ 題庫總覽」分頁按鈕
