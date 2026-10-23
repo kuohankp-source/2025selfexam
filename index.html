@@ -40,14 +40,14 @@
           </p>
         </div>
 
-        <div class="login-form">
+        <div class="login-form" id="login-form-box">
           <div class="form-group">
             <label for="login-username" class="form-label">學生帳號 (Username)</label>
             <input
               type="text"
               id="login-username"
               class="form-input"
-              placeholder="請輸入專屬帳號 (例如：KUO)"
+              placeholder="請輸入你的帳號"
               autocomplete="username"
               onkeydown="handleLoginKeydown(event)"
             />
@@ -70,6 +70,39 @@
           <button type="button" id="login-btn" class="btn-primary btn-login" onclick="handleLogin()">
             登入系統
           </button>
+          <button type="button" class="btn-outline btn-login" style="margin-top: 10px;" onclick="showRegisterForm()">
+            第一次使用？註冊帳號
+          </button>
+        </div>
+
+        <!-- 學生註冊：密碼由系統產生，經由老師與補習班轉交 -->
+        <div class="login-form hidden" id="register-form-box">
+          <div class="form-group">
+            <label for="reg-code" class="form-label">班別註冊碼</label>
+            <input type="text" id="reg-code" class="form-input" placeholder="請輸入老師公布的註冊碼" autocomplete="off" />
+          </div>
+          <div class="form-group">
+            <label for="reg-name" class="form-label">姓名</label>
+            <input type="text" id="reg-name" class="form-input" placeholder="請輸入你的中文姓名" autocomplete="off" />
+          </div>
+          <div class="form-group">
+            <label for="reg-username" class="form-label">想使用的帳號</label>
+            <input type="text" id="reg-username" class="form-input" placeholder="4 到 20 個英文字母、數字或底線" autocomplete="off" />
+          </div>
+          <div class="form-group">
+            <label for="reg-username2" class="form-label">再輸入一次帳號</label>
+            <input type="text" id="reg-username2" class="form-input" placeholder="請再輸入一次相同的帳號" autocomplete="off" />
+          </div>
+          <div id="register-status" class="login-status" role="status" aria-live="polite"></div>
+          <button type="button" id="register-btn" class="btn-primary btn-login" onclick="handleRegister()">
+            送出註冊
+          </button>
+          <button type="button" class="btn-outline btn-login" style="margin-top: 10px;" onclick="showLoginForm()">
+            返回登入
+          </button>
+          <p class="login-card-desc" style="margin-top: 12px;">
+            🔐 密碼由系統隨機產生，註冊完成後會由老師透過補習班轉交給你。請勿使用你在其他網站用過的帳號。
+          </p>
         </div>
 
         <div class="login-footer-hint">
@@ -116,6 +149,12 @@
           </button>
           <button type="button" id="tab-btn-admin" class="nav-tab-btn admin-tab-btn hidden" onclick="switchTab('view-admin-bank')">
             🛠️ 題庫總覽
+          </button>
+          <button type="button" id="tab-btn-admin-log" class="nav-tab-btn admin-tab-btn hidden" onclick="switchTab('view-admin-log')">
+            📋 使用紀錄
+          </button>
+          <button type="button" id="tab-btn-admin-accounts" class="nav-tab-btn admin-tab-btn hidden" onclick="switchTab('view-admin-accounts')">
+            👤 帳號管理
           </button>
         </nav>
       </div>
@@ -185,12 +224,10 @@
           </div>
 
           <div class="taxonomy-controls">
-            <!-- 第一層：主分類下拉選單 -->
+            <!-- 第一層：講義勾選清單（可複選） -->
             <div class="taxonomy-layer">
-              <label for="study-main-select" class="layer-label">第一層｜選擇講義主分類：</label>
-              <select id="study-main-select" class="form-select" onchange="handleStudyMainCategoryChange()">
-                <option value="ALL">全部講義 (跨單元)</option>
-              </select>
+              <span class="layer-label">第一層｜勾選講義（可複選）：</span>
+              <div id="study-main-grid" class="sub-category-grid"></div>
             </div>
 
             <!-- 第二層：子分類核取方塊清單 -->
@@ -203,6 +240,12 @@
                 </div>
               </div>
               <div id="study-sub-grid" class="sub-category-grid"></div>
+            </div>
+
+            <!-- 送出勾選範圍後才向雲端載入觀念卡 -->
+            <div class="quiz-launch-bar">
+              <button type="button" id="study-load-btn" class="btn-primary" onclick="loadStudyCards()">📥 載入觀念卡</button>
+              <span id="study-load-status" class="section-subtitle"></span>
             </div>
           </div>
         </div>
@@ -242,12 +285,10 @@
           </div>
 
           <div class="taxonomy-controls">
-            <!-- 第一層：主分類下拉選單 -->
+            <!-- 第一層：講義勾選清單（可複選） -->
             <div class="taxonomy-layer">
-              <label for="quiz-main-select" class="layer-label">第一層｜選擇測驗講義主分類：</label>
-              <select id="quiz-main-select" class="form-select" onchange="handleQuizMainCategoryChange()">
-                <option value="ALL">全部講義 (跨單元)</option>
-              </select>
+              <span class="layer-label">第一層｜勾選測驗講義（可複選）：</span>
+              <div id="quiz-main-grid" class="sub-category-grid"></div>
             </div>
 
             <!-- 第二層：子分類核取方塊清單 -->
@@ -533,6 +574,118 @@
 
         <!-- 題目列表清單 -->
         <div id="admin-questions-container" class="cards-stack"></div>
+      </article>
+
+      <!-- ==================== [視圖 9] 📋 管理者使用紀錄 (#view-admin-log) ==================== -->
+      <article id="view-admin-log" class="app-view hidden">
+        <div class="section-card admin-header-card">
+          <div class="taxonomy-header">
+            <div>
+              <div class="admin-badge-row">
+                <span class="admin-role-badge">👑 管理者專用</span>
+                <span id="admin-log-range-label" class="count-pill">尚未查詢</span>
+              </div>
+              <h2 class="section-title">📋 使用紀錄與學習分析</h2>
+              <p class="section-subtitle">依時間區間檢視學生的登入、載入與測驗行為，以及學生摘要、異常提醒與錯題排行榜</p>
+            </div>
+          </div>
+
+          <div class="history-filter-bar" role="group" aria-label="使用紀錄時間區間">
+            <button type="button" id="log-preset-today" class="filter-range-btn" onclick="setAdminLogPreset('today')">今天</button>
+            <button type="button" id="log-preset-7d" class="filter-range-btn" onclick="setAdminLogPreset('7d')">近 7 天</button>
+            <button type="button" id="log-preset-30d" class="filter-range-btn" onclick="setAdminLogPreset('30d')">近 30 天</button>
+            <button type="button" id="log-preset-all" class="filter-range-btn" onclick="setAdminLogPreset('all')">全部紀錄</button>
+          </div>
+
+          <div class="admin-filter-grid" style="margin-top: 12px;">
+            <div class="admin-filter-item">
+              <label for="log-from-date" class="layer-label">起始日期：</label>
+              <input type="date" id="log-from-date" class="form-select" />
+            </div>
+            <div class="admin-filter-item">
+              <label for="log-to-date" class="layer-label">結束日期：</label>
+              <input type="date" id="log-to-date" class="form-select" />
+            </div>
+            <div class="admin-filter-item">
+              <span class="layer-label">&nbsp;</span>
+              <button type="button" class="btn-primary" onclick="applyAdminLogCustomRange()">🔍 查詢自訂區間</button>
+            </div>
+          </div>
+
+          <div class="admin-filter-grid" style="margin-top: 12px;">
+            <div class="admin-filter-item">
+              <label for="log-filter-cohort" class="layer-label">班別：</label>
+              <select id="log-filter-cohort" class="form-select" onchange="handleAdminLogCohortChange()">
+                <option value="ALL">全部班別</option>
+              </select>
+            </div>
+            <div class="admin-filter-item">
+              <label for="log-filter-user" class="layer-label">學生：</label>
+              <select id="log-filter-user" class="form-select" onchange="renderAdminLog()">
+                <option value="ALL">全部學生</option>
+              </select>
+            </div>
+            <div class="admin-filter-item">
+              <label for="log-filter-action" class="layer-label">動作（套用於明細）：</label>
+              <select id="log-filter-action" class="form-select" onchange="renderAdminLog()">
+                <option value="ALL">全部動作</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div id="admin-log-summary" class="section-card"></div>
+        <div id="admin-log-anomalies" class="section-card"></div>
+        <div id="admin-log-students" class="section-card"></div>
+        <div id="admin-log-student-detail" class="section-card hidden"></div>
+        <div id="admin-log-topwrong" class="section-card"></div>
+        <div id="admin-log-details" class="section-card"></div>
+      </article>
+
+      <!-- ==================== [視圖 10] 👤 管理者帳號管理 (#view-admin-accounts) ==================== -->
+      <article id="view-admin-accounts" class="app-view hidden">
+        <div class="section-card admin-header-card">
+          <div class="taxonomy-header">
+            <div>
+              <div class="admin-badge-row">
+                <span class="admin-role-badge">👑 管理者專用</span>
+                <span id="accounts-discord-status" class="count-pill">讀取中</span>
+                <span id="accounts-summary" class="count-pill"></span>
+              </div>
+              <h2 class="section-title">👤 名單與帳號管理</h2>
+              <p class="section-subtitle">本頁不顯示任何密碼；重設或查詢密碼時，一律傳送到 Discord</p>
+            </div>
+            <div class="admin-header-actions">
+              <button type="button" class="btn-outline" onclick="loadAccounts()">🔄 重新整理</button>
+            </div>
+          </div>
+          <h3 class="section-title" style="margin-top: 12px;">班別註冊碼</h3>
+          <div id="accounts-cohorts"></div>
+          <div class="admin-filter-grid" style="margin-top: 12px;">
+            <div class="admin-filter-item">
+              <label for="accounts-filter-cohort" class="layer-label">班別：</label>
+              <select id="accounts-filter-cohort" class="form-select" onchange="renderAccounts()">
+                <option value="ALL">全部班別</option>
+              </select>
+            </div>
+            <div class="admin-filter-item">
+              <label for="accounts-filter-status" class="layer-label">狀態：</label>
+              <select id="accounts-filter-status" class="form-select" onchange="renderAccounts()">
+                <option value="ALL">全部狀態</option>
+                <option value="使用中">使用中</option>
+                <option value="未註冊">未註冊</option>
+                <option value="停用">停用</option>
+              </select>
+            </div>
+            <div class="admin-filter-item">
+              <label for="accounts-search" class="layer-label">搜尋姓名或帳號：</label>
+              <input type="text" id="accounts-search" class="form-select" oninput="renderAccounts()" />
+            </div>
+          </div>
+        </div>
+        <div class="section-card">
+          <div id="accounts-table"></div>
+        </div>
       </article>
     </section>
   </main>

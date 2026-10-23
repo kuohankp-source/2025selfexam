@@ -25,6 +25,10 @@ const GAS_ENDPOINT_URL =
 
 // [1.2] 全域資料容器
 let currentUser = null;
+let sessionToken = null; // 登入後由後端發放的 token，之後每次請求都會附上
+
+// 通訊方式：true = POST(text/plain，無網址長度限制、密碼不會出現在網址)；false = 舊版 GET
+const API_USE_POST = true;
 let conceptBank = [];
 let questionBank = [];
 let quizHistory = [];
@@ -54,9 +58,33 @@ let currentHistoryFilter = "6m";
  */
 async function callGasApi(action, dataObj = {}) {
   const payload = { action, ...dataObj };
-  const url = `${GAS_ENDPOINT_URL}?payload=${encodeURIComponent(JSON.stringify(payload))}`;
-  const response = await fetch(url, { method: "GET", mode: "cors" });
-  return await response.json();
+  if (sessionToken && action !== "login") {
+    payload.token = sessionToken;
+  }
+
+  let response;
+  if (API_USE_POST) {
+    // text/plain 屬於「簡單請求」，不會觸發 CORS 預檢；後端 doPost 已支援
+    response = await fetch(GAS_ENDPOINT_URL, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify(payload),
+      redirect: "follow"
+    });
+  } else {
+    const url = `${GAS_ENDPOINT_URL}?payload=${encodeURIComponent(JSON.stringify(payload))}`;
+    response = await fetch(url, { method: "GET", mode: "cors" });
+  }
+
+  const res = await response.json();
+
+  // 登入逾時（token 過期）或後端要求重新登入
+  if (res && res.code === "AUTH_REQUIRED" && action !== "login") {
+    sessionToken = null;
+    alert("登入已逾時，請重新登入。");
+    handleLogout();
+  }
+  return res;
 }
 
 /**
@@ -73,10 +101,9 @@ function sanitizeAndRepairLatex(rawStr) {
 
   // 2. 清理試算表歷史遺留的文字干擾片段（例如 "$刻 $", "$為 $"）
   s = s.replace(/\$刻\s*\$/g, "").replace(/\$為\s*\$/g, "");
-  s = s.replace(/\$\s+\$/g, "$");
 
-  // 3. 修復 "$$...$"（開頭為雙錢號、結尾為單錢號）
-  s = s.replace(/\$\$([^$]+)\$/g, "$$1$");
+  // 3. 修復 "$$...$"（開頭為雙錢號、結尾為單錢號；(?!\$) 避免誤傷正常的 $$...$$ 顯示式公式）
+  s = s.replace(/\$\$([^$]+)\$(?!\$)/g, (m, body) => "$" + body + "$");
 
   // 4. 修復常見單位殘缺（例如 "$0\text{$" -> "$0\text{ m}$", "$24\text{$" -> "$24\text{ m}$"）
   s = s.replace(/(\d+)\s*\\text\{\s*(\$)?$/g, "$1\\text{ m}$2");
@@ -404,6 +431,118 @@ function normalizeHistoryItem(raw) {
   };
 }
 
+/* ============================================================================
+ * [MODULE 2.5] 按需載入引擎 (On-demand Loader)
+ * 登入時只取得「目錄」；勾選範圍後才向雲端要觀念卡與題目，已載入的資料會留在記憶體重複使用。
+ * ============================================================================ */
+const UNIT_SEP = "\u0001";
+let catalog = [];                       // [{ main, conceptCount, questionCount, subs:[{sub, conceptCount, questionCount}] }]
+let loadedUnitKeys = new Set();         // 已載入的「講義 + 觀念子分類」
+let requestedQuestionIds = new Set();   // 已向雲端要過的題號（避免重複請求）
+let requestedConceptIds = new Set();    // 已向雲端要過的觀念編號
+let studyShownKeys = new Set();         // 觀念複習目前顯示的範圍
+let unitLoadQueue = Promise.resolve();
+
+function unitKey(main, sub) {
+  return `${main}${UNIT_SEP}${sub}`;
+}
+
+function splitUnitKey(key) {
+  const idx = key.indexOf(UNIT_SEP);
+  return { main: key.slice(0, idx), sub: key.slice(idx + 1) };
+}
+
+function itemUnitKey(item) {
+  return unitKey(item.main_category, item.sub_category);
+}
+
+/** 將雲端回傳的觀念卡與題目併入本地暫存（以編號去重） */
+function mergeLoadedItems(rawConcepts, rawQuestions) {
+  const conceptMap = new Map(conceptBank.map(c => [c.concept_id, c]));
+  (Array.isArray(rawConcepts) ? rawConcepts : [])
+    .map(normalizeConceptItem)
+    .filter(c => c && c.concept_id)
+    .forEach(c => conceptMap.set(c.concept_id, c));
+  conceptBank = Array.from(conceptMap.values());
+
+  const questionMap = new Map(questionBank.map(q => [q.id, q]));
+  (Array.isArray(rawQuestions) ? rawQuestions : [])
+    .map(q => normalizeQuestionItem(q, conceptMap))
+    .filter(q => q && q.id && q.question)
+    .forEach(q => questionMap.set(q.id, q));
+  questionBank = Array.from(questionMap.values());
+}
+
+async function loadUnitsNow(keys) {
+  const missing = Array.from(new Set(keys)).filter(k => !loadedUnitKeys.has(k));
+  if (missing.length === 0) return;
+  // v3.1：後端每次只接受一本講義，依講義分批請求
+  const byMain = new Map();
+  missing.forEach(k => {
+    const { main } = splitUnitKey(k);
+    if (!byMain.has(main)) byMain.set(main, []);
+    byMain.get(main).push(k);
+  });
+  for (const [, groupKeys] of byMain) {
+    const res = await callGasApi("getUnitData", { units: groupKeys.map(splitUnitKey) });
+    if (!res || !res.success) {
+      throw new Error((res && res.message) || "無法載入所選範圍的資料");
+    }
+    mergeLoadedItems(res.concepts, res.questions);
+    groupKeys.forEach(k => loadedUnitKeys.add(k));
+  }
+}
+
+/** 確保指定範圍已載入；多個請求會依序排隊，避免同一範圍重複下載 */
+function ensureUnitsLoaded(keys) {
+  const run = unitLoadQueue.then(() => loadUnitsNow(keys));
+  unitLoadQueue = run.catch(() => {});
+  return run;
+}
+
+/** 依題號／觀念編號補齊資料（錯題、歷史快照、觀念對照彈窗使用） */
+async function ensureItemsLoaded(questionIds, conceptIds) {
+  const haveQ = new Set(questionBank.map(q => q.id));
+  const haveC = new Set(conceptBank.map(c => c.concept_id));
+  const needQ = Array.from(new Set((questionIds || []).map(String)))
+    .filter(id => id && !haveQ.has(id) && !requestedQuestionIds.has(id));
+  const needC = Array.from(new Set((conceptIds || []).map(String)))
+    .filter(id => id && !haveC.has(id) && !requestedConceptIds.has(id));
+  if (needQ.length === 0 && needC.length === 0) return;
+  needQ.forEach(id => requestedQuestionIds.add(id));
+  needC.forEach(id => requestedConceptIds.add(id));
+
+  const Q_CHUNK = 200;
+  const C_CHUNK = 10;
+  const rounds = Math.max(Math.ceil(needQ.length / Q_CHUNK), Math.ceil(needC.length / C_CHUNK));
+  for (let r = 0; r < rounds; r++) {
+    const res = await callGasApi("getItemsByIds", {
+      questionIds: needQ.slice(r * Q_CHUNK, (r + 1) * Q_CHUNK),
+      conceptIds: needC.slice(r * C_CHUNK, (r + 1) * C_CHUNK)
+    });
+    if (res && res.success) {
+      mergeLoadedItems(res.concepts, res.questions);
+    }
+  }
+}
+
+function catalogTotals() {
+  return catalog.reduce(
+    (acc, m) => ({ concepts: acc.concepts + (m.conceptCount || 0), questions: acc.questions + (m.questionCount || 0) }),
+    { concepts: 0, questions: 0 }
+  );
+}
+
+function findCatalogSub(key) {
+  const { main, sub } = splitUnitKey(key);
+  const m = catalog.find(x => x.main === main);
+  return m ? m.subs.find(s => s.sub === sub) : null;
+}
+
+function loadingBoxHtml(text) {
+  return `<div class="empty-state-box">⏳ ${escapeHtml(text)}</div>`;
+}
+
 /**
  * [2.2] 處理登入與兩階段雲端初始資料載入
  */
@@ -431,7 +570,7 @@ async function handleLogin() {
 
   try {
     loginBtn.disabled = true;
-    statusEl.textContent = "🔄 第一階段：正在向雲端驗證帳號身分...";
+    statusEl.textContent = "🔄 正在向雲端驗證帳號身分並取得講義目錄...";
     statusEl.className = "login-status loading";
 
     // 第一階段：呼叫 login 驗證帳密
@@ -443,13 +582,20 @@ async function handleLogin() {
       return;
     }
 
+    sessionToken = loginRes.token || null;
+    if (!sessionToken) {
+      statusEl.textContent = "❌ 後端尚未更新為安全版（未收到登入憑證 token），請先重新部署 Code.gs。";
+      statusEl.className = "login-status error";
+      loginBtn.disabled = false;
+      return;
+    }
+
     // 判斷管理者權限（試算表 E 欄核取方塊）
-    // 若後端回傳 isAdmin: true，或者帳號為 KUO / 郭老師，賦予管理者權限
+    // 管理者權限完全以後端回傳為準
     const isAdmin = Boolean(
       loginRes.user && (
         loginRes.user.isAdmin === true ||
-        String(loginRes.user.isAdmin).toUpperCase() === "TRUE" ||
-        loginRes.user.username?.toUpperCase() === "KUO"
+        String(loginRes.user.isAdmin).toUpperCase() === "TRUE"
       )
     );
 
@@ -459,8 +605,9 @@ async function handleLogin() {
     };
 
     // 第二階段：立刻呼叫 getInitialData 取得觀念庫、題庫與歷史紀錄
-    statusEl.textContent = "☁️ 第二階段：驗證成功！正在同步雲端講義觀念庫、題庫與歷史快照...";
-    const initRes = await callGasApi("getInitialData", { username: currentUser.username });
+    statusEl.textContent = "☁️ 驗證成功！正在整理講義目錄與作答紀錄...";
+    // v3.1：登入回應已包含初始資料；若後端是舊版才另外請求
+    const initRes = Array.isArray(loginRes.catalog) ? loginRes : await callGasApi("getInitialData", { username: currentUser.username });
 
     if (!initRes || !initRes.success) {
       statusEl.textContent = `❌ 資料同步失敗：${(initRes && initRes.message) || "無法取得雲端題庫"}`;
@@ -469,18 +616,13 @@ async function handleLogin() {
       return;
     }
 
-    // 正規化觀念庫
-    const rawConcepts = Array.isArray(initRes.concepts) ? initRes.concepts : [];
-    conceptBank = rawConcepts.map(normalizeConceptItem).filter(c => c && c.concept_id);
-
-    const conceptLookupMap = new Map();
-    conceptBank.forEach(c => conceptLookupMap.set(c.concept_id, c));
-
-    // 正規化題庫
-    const rawQuestions = Array.isArray(initRes.questions) ? initRes.questions : [];
-    questionBank = rawQuestions
-      .map(q => normalizeQuestionItem(q, conceptLookupMap))
-      .filter(q => q && q.id && q.question);
+    // 只取得目錄、本人歷史，以及未訂正錯題的題目內容（其餘資料於勾選範圍後才載入）
+    catalog = Array.isArray(initRes.catalog) ? initRes.catalog : [];
+    const initItems = initRes.items || {};
+    mergeLoadedItems(initItems.concepts, initItems.questions);
+    (Array.isArray(initItems.questions) ? initItems.questions : []).forEach(q => {
+      if (q && q.id) requestedQuestionIds.add(String(q.id));
+    });
 
     // 正規化歷史紀錄
     const rawHistory = Array.isArray(initRes.history)
@@ -501,7 +643,8 @@ async function handleLogin() {
         : `👤 學生：${currentUser.name || currentUser.username}`;
     }
     if (syncBadgeEl) {
-      syncBadgeEl.textContent = `🟢 雲端同步 (${conceptBank.length}觀念/${questionBank.length}題)`;
+      const totals = catalogTotals();
+      syncBadgeEl.textContent = `🟢 雲端同步 (${catalog.length}本講義/${totals.concepts}觀念/${totals.questions}題)`;
     }
 
     // 根據管理權限顯示或隱藏「🛠️ 題庫總覽」分頁按鈕
@@ -512,6 +655,10 @@ async function handleLogin() {
         adminTabBtn.classList.add("hidden");
       }
     }
+    const adminLogTabBtn = document.getElementById("tab-btn-admin-log");
+    if (adminLogTabBtn) adminLogTabBtn.classList.toggle("hidden", !currentUser.isAdmin);
+    const accountsTabBtn = document.getElementById("tab-btn-admin-accounts");
+    if (accountsTabBtn) accountsTabBtn.classList.toggle("hidden", !currentUser.isAdmin);
 
     // 隱藏 #login-view，顯示 #main-app
     document.getElementById("login-view").classList.add("hidden");
@@ -551,9 +698,15 @@ function handleLogout() {
   }
 
   currentUser = null;
+  sessionToken = null;
   conceptBank = [];
   questionBank = [];
   quizHistory = [];
+  catalog = [];
+  loadedUnitKeys = new Set();
+  requestedQuestionIds = new Set();
+  requestedConceptIds = new Set();
+  studyShownKeys = new Set();
   unresolvedMistakeMap.clear();
   quizQuestions = [];
   quizAnswersRecord = [];
@@ -568,6 +721,14 @@ function handleLogout() {
 
   const adminTabBtn = document.getElementById("tab-btn-admin");
   if (adminTabBtn) adminTabBtn.classList.add("hidden");
+  const adminLogTabBtn = document.getElementById("tab-btn-admin-log");
+  if (adminLogTabBtn) adminLogTabBtn.classList.add("hidden");
+  adminLogData = null;
+  adminLogInitialized = false;
+  const accountsTabBtn = document.getElementById("tab-btn-admin-accounts");
+  if (accountsTabBtn) accountsTabBtn.classList.add("hidden");
+  accountsData = null;
+  accountsInitialized = false;
 
   document.getElementById("main-app").classList.add("hidden");
   document.getElementById("login-view").classList.remove("hidden");
@@ -599,7 +760,9 @@ function switchTab(tabKey) {
     "view-active-quiz",
     "view-history",
     "view-retry",
-    "view-admin-bank"
+    "view-admin-bank",
+    "view-admin-log",
+    "view-admin-accounts"
   ];
 
   allViews.forEach(viewId => {
@@ -622,7 +785,9 @@ function switchTab(tabKey) {
     "view-active-quiz": "tab-btn-quiz",
     "view-history": "tab-btn-history",
     "view-retry": "tab-btn-retry",
-    "view-admin-bank": "tab-btn-admin"
+    "view-admin-bank": "tab-btn-admin",
+    "view-admin-log": "tab-btn-admin-log",
+    "view-admin-accounts": "tab-btn-admin-accounts"
   };
 
   const activeBtnId = tabBtnMap[tabKey];
@@ -645,6 +810,10 @@ function switchTab(tabKey) {
     initRetryQuizUI();
   } else if (tabKey === "view-admin-bank") {
     renderAdminQuestionList();
+  } else if (tabKey === "view-admin-log") {
+    initAdminLogView();
+  } else if (tabKey === "view-admin-accounts") {
+    initAccountsView();
   }
 }
 
@@ -652,23 +821,29 @@ function switchTab(tabKey) {
  * [3.3] 跨視圖「對照核心觀念 (concept_id)」居中模態彈窗 (openConceptModal)
  * 根據 concept_id 從 conceptBank 查找對應觀念卡片；若無 concept_id 則退回以 sub_category 匹配顯示。
  */
-function openConceptModal(conceptId, fallbackSubCategory = "") {
+async function openConceptModal(conceptId, fallbackSubCategory = "") {
   const modalBackdrop = document.getElementById("concept-modal-backdrop");
   const modalBody = document.getElementById("concept-modal-body");
   if (!modalBackdrop || !modalBody) return;
+
+  modalBackdrop.classList.remove("hidden");
+
+  if (conceptId && !conceptBank.some(c => c.concept_id === conceptId)) {
+    modalBody.innerHTML = loadingBoxHtml("正在載入對應的觀念卡...");
+    try {
+      await ensureItemsLoaded([], [conceptId]);
+    } catch (err) {
+      console.warn("觀念卡載入失敗：", err);
+    }
+  }
 
   let matchedConcepts = [];
   if (conceptId) {
     const exact = conceptBank.find(c => c.concept_id === conceptId);
     if (exact) matchedConcepts.push(exact);
   }
-
   if (matchedConcepts.length === 0 && fallbackSubCategory) {
     matchedConcepts = conceptBank.filter(c => c.sub_category === fallbackSubCategory);
-  }
-
-  if (matchedConcepts.length === 0 && conceptBank.length > 0) {
-    matchedConcepts = [conceptBank[0]];
   }
 
   if (matchedConcepts.length === 0) {
@@ -677,8 +852,6 @@ function openConceptModal(conceptId, fallbackSubCategory = "") {
     modalBody.innerHTML = matchedConcepts.map(c => buildConceptCardHtml(c)).join("");
     triggerKaTeXRender(modalBody);
   }
-
-  modalBackdrop.classList.remove("hidden");
 }
 
 function closeConceptModal() {
@@ -699,77 +872,103 @@ function handleModalBackdropClick(event) {
  * ============================================================================ */
 
 /**
- * 初始化「觀念複習」與「快速測驗」的第一層主分類下拉選單與第二層子分類核取方塊
+ * 初始化「觀念複習」與「快速測驗」的第一層講義勾選清單（依目錄產生，不載入任何題目）
  */
 function initTaxonomyFilters() {
-  const mainCategories = Array.from(new Set(conceptBank.map(c => c.main_category).filter(Boolean)));
-
-  const studyMainSelect = document.getElementById("study-main-select");
-  const quizMainSelect = document.getElementById("quiz-main-select");
-
-  const optionsHtml = [
-    `<option value="ALL">全部講義 (跨單元)</option>`,
-    ...mainCategories.map(cat => `<option value="${escapeHtml(cat)}">${escapeHtml(cat)}</option>`)
-  ].join("");
-
-  if (studyMainSelect) studyMainSelect.innerHTML = optionsHtml;
-  if (quizMainSelect) quizMainSelect.innerHTML = optionsHtml;
-
+  renderMainCheckboxes("study");
+  renderMainCheckboxes("quiz");
   populateSubCategoryCheckboxes("study");
   populateSubCategoryCheckboxes("quiz");
 }
 
-/**
- * 根據第一層選擇的 main_category，嚴格只萃取第二層 sub_category 渲染為核取方塊清單
- * 嚴禁將第三層的 title 放進核取方塊！
- */
-function populateSubCategoryCheckboxes(mode) {
-  const mainSelectId = mode === "study" ? "study-main-select" : "quiz-main-select";
-  const gridId = mode === "study" ? "study-sub-grid" : "quiz-sub-grid";
-
-  const mainSelect = document.getElementById(mainSelectId);
-  const subGrid = document.getElementById(gridId);
-  if (!mainSelect || !subGrid) return;
-
-  const selectedMain = mainSelect.value;
-
-  // 從 conceptBank 萃取屬於該主分類的所有不重複 sub_category
-  const filteredConcepts =
-    selectedMain === "ALL"
-      ? conceptBank
-      : conceptBank.filter(c => c.main_category === selectedMain);
-
-  const subCategories = Array.from(new Set(filteredConcepts.map(c => c.sub_category).filter(Boolean)));
-
-  if (subCategories.length === 0) {
-    subGrid.innerHTML = `<div class="empty-state-box">此講義分類下尚無子分類資料</div>`;
+function renderMainCheckboxes(mode) {
+  const grid = document.getElementById(`${mode}-main-grid`);
+  if (!grid) return;
+  if (catalog.length === 0) {
+    grid.innerHTML = `<div class="empty-state-box">目前沒有開放的講義，請洽詢老師。</div>`;
     return;
   }
-
-  subGrid.innerHTML = subCategories
-    .map(sub => {
+  grid.innerHTML = catalog
+    .map(m => {
+      const countText = mode === "quiz" ? `${m.questionCount} 題` : `${m.conceptCount} 張觀念卡`;
       return `
         <label class="sub-check-item">
           <input
             type="checkbox"
-            class="${mode}-sub-checkbox"
-            value="${escapeHtml(sub)}"
-            checked
-            onchange="${mode === "study" ? "renderStudyCards()" : "updateQuizAvailableCount()"}"
+            class="${mode}-main-checkbox"
+            value="${escapeHtml(m.main)}"
+            onchange="handleMainCategoryChange('${mode}')"
           />
-          <span>${escapeHtml(sub)}</span>
+          <span>${escapeHtml(m.main)}（${countText}）</span>
         </label>
       `;
     })
     .join("");
+}
+
+function getCheckedMains(mode) {
+  return Array.from(document.querySelectorAll(`.${mode}-main-checkbox:checked`)).map(cb => cb.value);
+}
+
+/**
+ * 第二層：依已勾選的講義列出其觀念子分類（資料來自目錄）
+ * 已顯示過的子分類保留原本的勾選狀態；新出現的子分類預設為勾選
+ */
+function populateSubCategoryCheckboxes(mode) {
+  const subGrid = document.getElementById(`${mode}-sub-grid`);
+  if (!subGrid) return;
+
+  const previouslyShown = new Set(
+    Array.from(document.querySelectorAll(`.${mode}-sub-checkbox`)).map(cb => cb.value)
+  );
+  const previouslyChecked = getCheckedSubCategories(mode);
+  const selectedMains = getCheckedMains(mode);
+
+  if (selectedMains.length === 0) {
+    subGrid.innerHTML = `<div class="empty-state-box">請先在第一層勾選至少一本講義，這裡就會出現該講義的觀念子分類。</div>`;
+  } else {
+    subGrid.innerHTML = catalog
+      .filter(m => selectedMains.includes(m.main))
+      .map(m => {
+        const items = m.subs
+          .map(s => {
+            const key = unitKey(m.main, s.sub);
+            const checked = previouslyShown.has(key) ? previouslyChecked.has(key) : true;
+            const countText = mode === "quiz" ? `${s.questionCount} 題` : `${s.conceptCount} 張`;
+            return `
+              <label class="sub-check-item">
+                <input
+                  type="checkbox"
+                  class="${mode}-sub-checkbox"
+                  value="${escapeHtml(key)}"
+                  ${checked ? "checked" : ""}
+                  onchange="${mode === "study" ? "updateStudyPendingHint()" : "updateQuizAvailableCount()"}"
+                />
+                <span>${escapeHtml(s.sub)}（${countText}）</span>
+              </label>
+            `;
+          })
+          .join("");
+        return `
+          <div style="grid-column: 1 / -1; font-weight: 700; margin-top: 6px;">📘 ${escapeHtml(m.main)}</div>
+          ${items}
+        `;
+      })
+      .join("");
+  }
 
   if (mode === "study") {
-    renderStudyCards();
+    updateStudyPendingHint();
   } else {
     updateQuizAvailableCount();
   }
 }
 
+function handleMainCategoryChange(mode) {
+  populateSubCategoryCheckboxes(mode);
+}
+
+// 保留舊名稱，避免舊版 HTML 呼叫時出錯
 function handleStudyMainCategoryChange() {
   populateSubCategoryCheckboxes("study");
 }
@@ -782,20 +981,18 @@ function handleQuizMainCategoryChange() {
  * 「全選子分類」與「全部取消」快捷按鈕
  */
 function toggleAllSubCategories(mode, checkedState) {
-  const checkboxes = document.querySelectorAll(`.${mode}-sub-checkbox`);
-  checkboxes.forEach(cb => {
+  document.querySelectorAll(`.${mode}-sub-checkbox`).forEach(cb => {
     cb.checked = checkedState;
   });
-
   if (mode === "study") {
-    renderStudyCards();
+    updateStudyPendingHint();
   } else {
     updateQuizAvailableCount();
   }
 }
 
 /**
- * 取得指定模式下已勾選的第二層 sub_category 集合
+ * 取得指定模式下已勾選的子分類（以「講義 + 子分類」為單位）
  */
 function getCheckedSubCategories(mode) {
   const checkboxes = document.querySelectorAll(`.${mode}-sub-checkbox:checked`);
@@ -803,22 +1000,68 @@ function getCheckedSubCategories(mode) {
 }
 
 /**
- * 即時更新「⚡ 快速測驗」符合勾選範圍的可用題庫數量
+ * 「⚡ 快速測驗」可用題數：直接由目錄計算，不需要先載入題目
  */
 function updateQuizAvailableCount() {
-  const mainSelect = document.getElementById("quiz-main-select");
-  const selectedMain = mainSelect ? mainSelect.value : "ALL";
-  const checkedSubs = getCheckedSubCategories("quiz");
-
-  const matchedQuestions = questionBank.filter(q => {
-    const matchMain = selectedMain === "ALL" || q.main_category === selectedMain;
-    const matchSub = checkedSubs.has(q.sub_category);
-    return matchMain && matchSub;
+  const checkedKeys = getCheckedSubCategories("quiz");
+  let total = 0;
+  checkedKeys.forEach(key => {
+    const s = findCatalogSub(key);
+    if (s) total += s.questionCount || 0;
   });
-
   const badgeEl = document.getElementById("quiz-available-count");
   if (badgeEl) {
-    badgeEl.textContent = `可用題庫：${matchedQuestions.length} 題`;
+    badgeEl.textContent = `可用題庫：${total} 題`;
+  }
+}
+
+/**
+ * 「📐 觀念複習」勾選狀態提示：勾選改變後，需按「載入觀念卡」才會更新卡片
+ */
+function updateStudyPendingHint() {
+  const statusEl = document.getElementById("study-load-status");
+  if (!statusEl) return;
+  const checkedKeys = getCheckedSubCategories("study");
+  let total = 0;
+  checkedKeys.forEach(key => {
+    const s = findCatalogSub(key);
+    if (s) total += s.conceptCount || 0;
+  });
+  const same =
+    checkedKeys.size === studyShownKeys.size &&
+    Array.from(checkedKeys).every(k => studyShownKeys.has(k));
+  if (checkedKeys.size === 0) {
+    statusEl.textContent = "尚未勾選任何觀念子分類。";
+  } else if (same) {
+    statusEl.textContent = `目前顯示的就是勾選範圍（${total} 張觀念卡）。`;
+  } else {
+    statusEl.textContent = `已勾選 ${checkedKeys.size} 個觀念子分類（共 ${total} 張觀念卡），請按「📥 載入觀念卡」。`;
+  }
+}
+
+/**
+ * 「📥 載入觀念卡」：向雲端取得勾選範圍的觀念卡後顯示
+ */
+async function loadStudyCards() {
+  const checkedKeys = Array.from(getCheckedSubCategories("study"));
+  if (checkedKeys.length === 0) {
+    alert("請先勾選講義與至少一個觀念子分類！");
+    return;
+  }
+  const btn = document.getElementById("study-load-btn");
+  const container = document.getElementById("study-cards-container");
+  if (btn) btn.disabled = true;
+  if (container) container.innerHTML = loadingBoxHtml("正在載入勾選範圍的觀念卡...");
+  try {
+    await ensureUnitsLoaded(checkedKeys);
+    studyShownKeys = new Set(checkedKeys);
+    renderStudyCards();
+  } catch (err) {
+    console.error(err);
+    if (container) container.innerHTML = `<div class="empty-state-box">❌ 載入失敗：${escapeHtml(err.message || "請稍後再試")}</div>`;
+  } finally {
+    if (btn) btn.disabled = false;
+    updateStudyPendingHint();
   }
 }
 
@@ -873,28 +1116,25 @@ function buildConceptCardHtml(concept) {
 function renderStudyCards() {
   const container = document.getElementById("study-cards-container");
   const summaryBadge = document.getElementById("study-count-summary");
-  const mainSelect = document.getElementById("study-main-select");
   if (!container) return;
 
-  const selectedMain = mainSelect ? mainSelect.value : "ALL";
-  const checkedSubs = getCheckedSubCategories("study");
-
-  const filtered = conceptBank.filter(c => {
-    const matchMain = selectedMain === "ALL" || c.main_category === selectedMain;
-    const matchSub = checkedSubs.has(c.sub_category);
-    return matchMain && matchSub;
-  });
+  const filtered = conceptBank.filter(c => studyShownKeys.has(itemUnitKey(c)));
 
   if (summaryBadge) {
     summaryBadge.textContent = `顯示 ${filtered.length} 張觀念卡`;
   }
 
-  if (filtered.length === 0) {
+  if (studyShownKeys.size === 0) {
     container.innerHTML = `
       <div class="empty-state-box">
-        📌 請在上方勾選至少一個「觀念子分類（sub_category）」以檢視對應的肯定句推導卡片。
+        📌 請在上方勾選講義與觀念子分類，再按「📥 載入觀念卡」。
       </div>
     `;
+    return;
+  }
+
+  if (filtered.length === 0) {
+    container.innerHTML = `<div class="empty-state-box">所選範圍目前沒有觀念卡資料。</div>`;
     return;
   }
 
@@ -976,24 +1216,39 @@ function shuffleArray(arr) {
 /**
  * [6.1] 題數選擇與啟動標準快速測驗 (initiateStandardQuiz)
  */
-function initiateStandardQuiz() {
-  const mainSelect = document.getElementById("quiz-main-select");
-  const selectedMain = mainSelect ? mainSelect.value : "ALL";
-  const checkedSubs = getCheckedSubCategories("quiz");
+async function initiateStandardQuiz() {
+  const checkedKeys = Array.from(getCheckedSubCategories("quiz"));
 
-  if (checkedSubs.size === 0) {
-    alert("請至少勾選一個觀念子分類（sub_category）再開始測驗！");
+  if (checkedKeys.length === 0) {
+    alert("請先勾選講義與至少一個觀念子分類再開始測驗！");
     return;
   }
 
-  const candidatePool = questionBank.filter(q => {
-    const matchMain = selectedMain === "ALL" || q.main_category === selectedMain;
-    const matchSub = checkedSubs.has(q.sub_category);
-    return matchMain && matchSub;
-  });
+  const startBtn = document.getElementById("start-quiz-btn");
+  const originalText = startBtn ? startBtn.textContent : "";
+  if (startBtn) {
+    startBtn.disabled = true;
+    startBtn.textContent = "📥 正在載入題目...";
+  }
+
+  try {
+    await ensureUnitsLoaded(checkedKeys);
+  } catch (err) {
+    console.error(err);
+    alert(`題目載入失敗：${err.message || "請稍後再試"}`);
+    return;
+  } finally {
+    if (startBtn) {
+      startBtn.disabled = false;
+      startBtn.textContent = originalText;
+    }
+  }
+
+  const keySet = new Set(checkedKeys);
+  const candidatePool = questionBank.filter(q => keySet.has(itemUnitKey(q)));
 
   if (candidatePool.length === 0) {
-    alert("目前勾選的分類範圍內沒有可用題目，請勾選其他子分類！");
+    alert("目前勾選的範圍內沒有可用題目，請勾選其他觀念子分類！");
     return;
   }
 
@@ -1005,11 +1260,11 @@ function initiateStandardQuiz() {
   currentQuizIndex = 0;
   quizAnswersRecord = [];
 
-  const subListArr = Array.from(checkedSubs);
+  const mains = Array.from(new Set(checkedKeys.map(k => splitUnitKey(k).main)));
   currentQuizUnitTitle =
-    subListArr.length === 1
-      ? subListArr[0]
-      : `${selectedMain === "ALL" ? "跨單元綜合" : selectedMain} (${subListArr.length}個觀念)`;
+    checkedKeys.length === 1
+      ? splitUnitKey(checkedKeys[0]).sub
+      : `${mains.length === 1 ? mains[0] : "跨單元綜合"} (${checkedKeys.length}個觀念)`;
 
   startActiveQuizView();
 }
@@ -1310,9 +1565,9 @@ async function finishQuiz() {
   }
 
   const scoreStr = `${correctCount} / ${totalCount}`;
-  const targetUsername = currentUser && currentUser.username ? currentUser.username : "KUO";
+  const targetUsername = currentUser && currentUser.username ? currentUser.username : "";
 
-  // 精簡版快照，大幅壓縮至 200~300 字元，URL 完全容納，100% 安全走 GET 通訊協定
+  // 精簡版快照（改用 POST 後已無網址長度限制；後端會再次驗證與限制長度）
   const compactSnapshots = quizAnswersRecord.map(r => ({
     qId: r.questionId,
     concept_id: r.concept_id,
@@ -1616,6 +1871,27 @@ function renderHistoryCards(filterRange = "6m") {
     summaryEl.textContent = `共 ${filteredHistory.length} 筆紀錄`;
   }
 
+  // 按需補齊此區間快照所需的題目內容（題幹、解析）；只有在歷史頁面顯示時才下載
+  const haveIds = new Set(questionBank.map(q => q.id));
+  const missingIds = [];
+  filteredHistory.forEach(session => {
+    (session.snapshots || []).forEach(snap => {
+      const id = snap && (snap.questionId || snap.qId);
+      if (id && !haveIds.has(id) && !requestedQuestionIds.has(id)) missingIds.push(id);
+    });
+  });
+  const historyView = document.getElementById("view-history");
+  const historyVisible = !(historyView && historyView.classList.contains("hidden"));
+  if (missingIds.length > 0 && historyVisible) {
+    container.innerHTML = loadingBoxHtml("正在載入歷史紀錄的題目內容...");
+    ensureItemsLoaded(missingIds, [])
+      .catch(err => console.warn("歷史題目載入失敗：", err))
+      .finally(() => {
+        if (currentHistoryFilter === filterRange) renderHistoryCards(filterRange);
+      });
+    return;
+  }
+
   if (filteredHistory.length === 0) {
     container.innerHTML = `
       <div class="empty-state-box">
@@ -1739,13 +2015,9 @@ function initAdminTaxonomyFilters() {
   const mainSelect = document.getElementById("admin-main-select");
   if (!mainSelect) return;
 
-  const mainCategories = Array.from(
-    new Set(questionBank.map(q => q.main_category).concat(conceptBank.map(c => c.main_category)).filter(Boolean))
-  );
-
   mainSelect.innerHTML = [
-    `<option value="ALL">全部講義 (跨單元)</option>`,
-    ...mainCategories.map(cat => `<option value="${escapeHtml(cat)}">${escapeHtml(cat)}</option>`)
+    ...catalog.map(m => `<option value="${escapeHtml(m.main)}">${escapeHtml(m.main)}（${m.questionCount} 題）</option>`),
+    `<option value="ALL">全部講義 (跨單元，載入較久)</option>`
   ].join("");
 
   handleAdminMainCategoryChange();
@@ -1760,18 +2032,14 @@ function handleAdminMainCategoryChange() {
   if (!mainSelect || !subSelect) return;
 
   const selectedMain = mainSelect.value;
-  const filteredQuestions =
-    selectedMain === "ALL"
-      ? questionBank
-      : questionBank.filter(q => q.main_category === selectedMain);
-
-  const subCategories = Array.from(
-    new Set(filteredQuestions.map(q => q.sub_category).filter(Boolean))
-  );
+  const subs = [];
+  catalog
+    .filter(m => selectedMain === "ALL" || m.main === selectedMain)
+    .forEach(m => m.subs.forEach(s => { if (!subs.includes(s.sub)) subs.push(s.sub); }));
 
   subSelect.innerHTML = [
-    `<option value="ALL">全部觀念子分類 (共 ${subCategories.length} 個子單元)</option>`,
-    ...subCategories.map(sub => `<option value="${escapeHtml(sub)}">${escapeHtml(sub)}</option>`)
+    `<option value="ALL">全部觀念子分類 (共 ${subs.length} 個子單元)</option>`,
+    ...subs.map(sub => `<option value="${escapeHtml(sub)}">${escapeHtml(sub)}</option>`)
   ].join("");
 
   renderAdminQuestionList();
@@ -1781,7 +2049,36 @@ function handleAdminMainCategoryChange() {
  * [8.3] 渲染管理者專屬題庫卡片清單
  * 完整檢視該單元底下的所有題目、選項、正確答案與詳解，不需隨機抽選
  */
-function renderAdminQuestionList() {
+async function renderAdminQuestionList() {
+  const container = document.getElementById("admin-questions-container");
+  const mainSelect = document.getElementById("admin-main-select");
+  const subSelect = document.getElementById("admin-sub-select");
+  if (!container) return;
+
+  const selectedMain = mainSelect ? mainSelect.value : "ALL";
+  const selectedSub = subSelect ? subSelect.value : "ALL";
+  const keys = [];
+  catalog
+    .filter(m => selectedMain === "ALL" || m.main === selectedMain)
+    .forEach(m => m.subs.forEach(s => {
+      if (selectedSub === "ALL" || s.sub === selectedSub) keys.push(unitKey(m.main, s.sub));
+    }));
+
+  if (keys.some(k => !loadedUnitKeys.has(k))) {
+    container.innerHTML = loadingBoxHtml("正在載入題庫...");
+    try {
+      await ensureUnitsLoaded(keys);
+    } catch (err) {
+      container.innerHTML = `<div class="empty-state-box">❌ 載入失敗：${escapeHtml(err.message || "請稍後再試")}</div>`;
+      return;
+    }
+    // 載入期間若管理者已切換選單，以最新選擇為準
+    if ((mainSelect ? mainSelect.value : "ALL") !== selectedMain || (subSelect ? subSelect.value : "ALL") !== selectedSub) return;
+  }
+  renderAdminQuestionListNow();
+}
+
+function renderAdminQuestionListNow() {
   const container = document.getElementById("admin-questions-container");
   const countBadge = document.getElementById("admin-questions-count");
   const mainSelect = document.getElementById("admin-main-select");
@@ -1799,7 +2096,7 @@ function renderAdminQuestionList() {
   });
 
   if (countBadge) {
-    countBadge.textContent = `顯示 ${filtered.length} 題 / 題庫總計 ${questionBank.length} 題`;
+    countBadge.textContent = `顯示 ${filtered.length} 題 / 題庫總計 ${catalogTotals().questions} 題`;
   }
 
   if (filtered.length === 0) {
@@ -1878,6 +2175,565 @@ function renderAdminQuestionList() {
     .join("");
 
   triggerKaTeXRender(container);
+}
+
+/* ============================================================================
+ * [MODULE 9.0] 管理者「📋 使用紀錄」頁面 (Admin Activity Dashboard)
+ * 依時間區間查詢：使用紀錄明細、學生統計摘要、學生測驗與錯題、異常提醒、錯題排行榜
+ * ============================================================================ */
+const LOG_ACTION_LABELS = {
+  LOGIN_OK: "登入",
+  LOGIN_FAIL: "登入失敗",
+  LOAD_UNIT: "載入講義",
+  LOAD_ITEMS: "補抓題目",
+  SUBMIT_QUIZ: "提交測驗",
+  RATE_LIMIT: "請求過於頻繁",
+  REGISTER_OK: "註冊帳號",
+  REGISTER_FAIL: "註冊失敗",
+  ADMIN_ACCOUNT: "帳號管理"
+};
+let adminLogData = null;
+let adminLogQuery = { from: null, to: null, label: "" };
+let adminLogInitialized = false;
+let adminLogShowCount = 300;
+let adminTopWrongCohort = "__ALL__";
+
+function initAdminLogView() {
+  if (!adminLogInitialized) {
+    adminLogInitialized = true;
+    setAdminLogPreset("7d");
+  }
+}
+
+function toDateInputValue(d) {
+  const pad = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function setAdminLogPreset(preset) {
+  const labels = { today: "今天", "7d": "近 7 天", "30d": "近 30 天", all: "全部紀錄" };
+  ["today", "7d", "30d", "all"].forEach(p => {
+    const btn = document.getElementById(`log-preset-${p}`);
+    if (btn) btn.classList.toggle("active", p === preset);
+  });
+  const now = new Date();
+  let from = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  if (preset === "7d") from.setDate(from.getDate() - 6);
+  if (preset === "30d") from.setDate(from.getDate() - 29);
+  if (preset === "all") from = null;
+  const fromInput = document.getElementById("log-from-date");
+  const toInput = document.getElementById("log-to-date");
+  if (fromInput) fromInput.value = from ? toDateInputValue(from) : "";
+  if (toInput) toInput.value = toDateInputValue(now);
+  queryAdminLog(from, null, labels[preset] || "");
+}
+
+function applyAdminLogCustomRange() {
+  const fromVal = (document.getElementById("log-from-date") || {}).value || "";
+  const toVal = (document.getElementById("log-to-date") || {}).value || "";
+  if (!fromVal && !toVal) {
+    alert("請至少選擇起始或結束日期！");
+    return;
+  }
+  const parse = v => {
+    const [y, m, d] = v.split("-").map(Number);
+    return new Date(y, m - 1, d);
+  };
+  const from = fromVal ? parse(fromVal) : null;
+  const to = toVal ? parse(toVal) : null;
+  if (to) to.setHours(23, 59, 59, 999);
+  if (from && to && from > to) {
+    alert("起始日期不能晚於結束日期！");
+    return;
+  }
+  ["today", "7d", "30d", "all"].forEach(p => {
+    const btn = document.getElementById(`log-preset-${p}`);
+    if (btn) btn.classList.remove("active");
+  });
+  queryAdminLog(from, to, `${fromVal || "最早"} ～ ${toVal || "今天"}`);
+}
+
+async function queryAdminLog(from, to, label) {
+  adminLogQuery = { from: from ? from.toISOString() : null, to: to ? to.toISOString() : null, label };
+  const rangeEl = document.getElementById("admin-log-range-label");
+  if (rangeEl) rangeEl.textContent = `查詢中：${label}`;
+  const summaryEl = document.getElementById("admin-log-summary");
+  if (summaryEl) summaryEl.innerHTML = loadingBoxHtml("正在讀取使用紀錄與作答資料...");
+  ["admin-log-anomalies", "admin-log-students", "admin-log-topwrong", "admin-log-details"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = "";
+  });
+  const detailEl = document.getElementById("admin-log-student-detail");
+  if (detailEl) detailEl.classList.add("hidden");
+
+  try {
+    const res = await callGasApi("getAdminDashboard", { from: adminLogQuery.from, to: adminLogQuery.to });
+    if (!res || !res.success) throw new Error((res && res.message) || "無法取得使用紀錄");
+    adminLogData = res;
+    adminLogShowCount = 300;
+    if (rangeEl) rangeEl.textContent = `區間：${label}`;
+    populateAdminLogFilters();
+    renderAdminLog();
+  } catch (err) {
+    console.error(err);
+    if (summaryEl) summaryEl.innerHTML = `<div class="empty-state-box">❌ 讀取失敗：${escapeHtml(err.message || "請稍後再試")}</div>`;
+  }
+}
+
+function setSelectOptions(id, options, keepValue = true) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const prev = el.value;
+  el.innerHTML = options.map(o => `<option value="${escapeHtml(o.value)}">${escapeHtml(o.label)}</option>`).join("");
+  if (keepValue && options.some(o => o.value === prev)) el.value = prev;
+}
+
+function populateAdminLogFilters() {
+  if (!adminLogData) return;
+  setSelectOptions("log-filter-cohort", [
+    { value: "ALL", label: "全部班別" },
+    ...adminLogData.cohorts.map(c => ({ value: c, label: c }))
+  ]);
+  const cohort = (document.getElementById("log-filter-cohort") || {}).value || "ALL";
+  const students = adminLogData.students
+    .filter(s => cohort === "ALL" || (s.cohort || "未分班") === cohort)
+    .sort((a, b) => a.username.localeCompare(b.username));
+  setSelectOptions("log-filter-user", [
+    { value: "ALL", label: "全部學生" },
+    ...students.map(s => ({ value: s.username, label: `${s.name}（${s.username}）` }))
+  ]);
+  setSelectOptions("log-filter-action", [
+    { value: "ALL", label: "全部動作" },
+    ...Object.entries(LOG_ACTION_LABELS).map(([k, v]) => ({ value: k, label: v }))
+  ]);
+}
+
+function handleAdminLogCohortChange() {
+  populateAdminLogFilters();
+  renderAdminLog();
+}
+
+function getAdminLogFilters() {
+  return {
+    cohort: (document.getElementById("log-filter-cohort") || {}).value || "ALL",
+    user: (document.getElementById("log-filter-user") || {}).value || "ALL",
+    action: (document.getElementById("log-filter-action") || {}).value || "ALL"
+  };
+}
+
+function matchCohortUser(item, f) {
+  if (f.cohort !== "ALL" && (item.cohort || "未分班") !== f.cohort) return false;
+  if (f.user !== "ALL" && String(item.username || "").toUpperCase() !== f.user.toUpperCase()) return false;
+  return true;
+}
+
+function percentText(v) {
+  return v === null || v === undefined ? "—" : `${v}%`;
+}
+
+function tableHtml(headers, rowsHtml) {
+  return `
+    <div style="overflow-x: auto;">
+      <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
+        <thead><tr>${headers.map(h => `<th style="text-align: left; padding: 8px; border-bottom: 2px solid #cbd5e1; white-space: nowrap;">${h}</th>`).join("")}</tr></thead>
+        <tbody>${rowsHtml}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+function td(content, extra = "") {
+  return `<td style="padding: 8px; border-bottom: 1px solid #e2e8f0; vertical-align: top; ${extra}">${content}</td>`;
+}
+
+function renderAdminLog() {
+  if (!adminLogData) return;
+  const f = getAdminLogFilters();
+  const d = adminLogData;
+
+  // 總覽
+  const summaryEl = document.getElementById("admin-log-summary");
+  if (summaryEl) {
+    summaryEl.innerHTML = `
+      <h3 class="section-title">📈 區間總覽</h3>
+      <div class="admin-badge-row" style="flex-wrap: wrap; gap: 8px;">
+        <span class="count-pill">活躍學生：${d.totals.activeStudents} 人</span>
+        <span class="count-pill">登入次數：${d.totals.loginCount}</span>
+        <span class="count-pill">測驗次數：${d.totals.quizCount}</span>
+        <span class="count-pill">整體答對率：${percentText(d.totals.accuracy)}</span>
+      </div>
+    `;
+  }
+
+  // 異常提醒
+  const anomalies = d.anomalies.filter(a => matchCohortUser(a, f));
+  const anomalyEl = document.getElementById("admin-log-anomalies");
+  if (anomalyEl) {
+    anomalyEl.innerHTML = `
+      <h3 class="section-title">⚠️ 異常行為提醒（${anomalies.length}）</h3>
+      ${
+        anomalies.length === 0
+          ? `<div class="empty-state-box">此區間沒有異常行為。</div>`
+          : tableHtml(
+              ["類型", "學生", "班別", "時間", "說明"],
+              anomalies
+                .map(a =>
+                  `<tr>${td(escapeHtml(a.type), "color: #b91c1c; font-weight: 600;")}${td(escapeHtml(`${a.name || ""}（${a.username}）`))}${td(escapeHtml(a.cohort || "—"))}${td(escapeHtml(formatTaiwanDateTime(a.from)) + (a.to !== a.from ? `<br>～ ${escapeHtml(formatTaiwanDateTime(a.to))}` : ""))}${td(escapeHtml(a.detail))}</tr>`
+                )
+                .join("")
+            )
+      }
+    `;
+  }
+
+  // 學生統計摘要
+  const students = d.students
+    .filter(s => matchCohortUser(s, f))
+    .sort((a, b) => (b.lastLogin || "").localeCompare(a.lastLogin || "") || a.username.localeCompare(b.username));
+  const studentEl = document.getElementById("admin-log-students");
+  if (studentEl) {
+    studentEl.innerHTML = `
+      <h3 class="section-title">👥 學生統計摘要（${students.length} 人）</h3>
+      ${
+        students.length === 0
+          ? `<div class="empty-state-box">沒有符合篩選條件的學生。</div>`
+          : tableHtml(
+              ["學生", "班別", "登入次數", "最近登入", "載入講義", "測驗次數", "平均答對率", "未訂正錯題", ""],
+              students
+                .map(s =>
+                  `<tr>${td(escapeHtml(`${s.name}（${s.username}）`))}${td(escapeHtml(s.cohort || "未分班"))}${td(s.loginCount)}${td(s.lastLogin ? escapeHtml(formatTaiwanDateTime(s.lastLogin)) : "—")}${td(s.loadCount)}${td(s.quizCount)}${td(percentText(s.accuracy))}${td(s.unresolved)}${td(`<button type="button" class="btn-chip" onclick="showStudentDetail('${escapeJsStr(s.username)}')">查看</button>`)}</tr>`
+                )
+                .join("")
+            )
+      }
+    `;
+  }
+
+  renderTopWrong();
+
+  // 使用紀錄明細
+  const logs = d.logs.filter(l => matchCohortUser(l, f) && (f.action === "ALL" || l.action === f.action));
+  const shown = logs.slice(0, adminLogShowCount);
+  const detailsEl = document.getElementById("admin-log-details");
+  if (detailsEl) {
+    detailsEl.innerHTML = `
+      <h3 class="section-title">🧾 使用紀錄明細（${logs.length} 筆${d.logsTruncated ? "，僅含區間內最新 3000 筆" : ""}）</h3>
+      ${
+        logs.length === 0
+          ? `<div class="empty-state-box">沒有符合篩選條件的紀錄。</div>`
+          : tableHtml(
+              ["時間", "學生", "班別", "動作", "講義", "細節", "數量"],
+              shown
+                .map(l =>
+                  `<tr>${td(escapeHtml(formatTaiwanDateTime(l.timestamp)), "white-space: nowrap;")}${td(escapeHtml(l.name ? `${l.name}（${l.username}）` : l.username))}${td(escapeHtml(l.cohort || "—"))}${td(escapeHtml(LOG_ACTION_LABELS[l.action] || l.action), l.action === "LOGIN_FAIL" || l.action === "RATE_LIMIT" ? "color: #b91c1c;" : "")}${td(escapeHtml(l.main || "—"))}${td(escapeHtml(l.detail || ""))}${td(l.count || "")}</tr>`
+                )
+                .join("")
+            ) +
+            (logs.length > shown.length
+              ? `<div style="margin-top: 12px;"><button type="button" class="btn-outline" onclick="showMoreAdminLogs()">顯示更多（尚有 ${logs.length - shown.length} 筆）</button></div>`
+              : "")
+      }
+    `;
+  }
+}
+
+function showMoreAdminLogs() {
+  adminLogShowCount += 300;
+  renderAdminLog();
+}
+
+function handleTopWrongCohortChange() {
+  const el = document.getElementById("log-topwrong-cohort");
+  adminTopWrongCohort = el ? el.value : "__ALL__";
+  renderTopWrong();
+}
+
+function renderTopWrong() {
+  const el = document.getElementById("admin-log-topwrong");
+  if (!el || !adminLogData) return;
+  const groups = adminLogData.topWrong || {};
+  const options = [{ value: "__ALL__", label: "全部學生" }, ...adminLogData.cohorts.map(c => ({ value: c, label: c }))];
+  if (!options.some(o => o.value === adminTopWrongCohort)) adminTopWrongCohort = "__ALL__";
+  const items = groups[adminTopWrongCohort] || [];
+  el.innerHTML = `
+    <div class="taxonomy-header">
+      <h3 class="section-title">📉 錯題排行榜（前 ${10} 名）</h3>
+      <select id="log-topwrong-cohort" class="form-select" onchange="handleTopWrongCohortChange()" style="max-width: 220px;">
+        ${options.map(o => `<option value="${escapeHtml(o.value)}" ${o.value === adminTopWrongCohort ? "selected" : ""}>${escapeHtml(o.label)}</option>`).join("")}
+      </select>
+    </div>
+    ${
+      items.length === 0
+        ? `<div class="empty-state-box">此區間沒有答錯的紀錄。</div>`
+        : tableHtml(
+            ["名次", "題目", "講義・子分類", "作答", "答錯", "錯誤率", ""],
+            items
+              .map((q, i) =>
+                `<tr>${td(i + 1)}${td(`${escapeHtml(q.prompt)}<div style="color: #15803d; margin-top: 4px;">✓ ${escapeHtml(q.correctAnswer)}</div>`)}${td(escapeHtml(`${q.main}・${q.sub}`))}${td(q.attempts)}${td(q.wrong)}${td(`${q.wrongRate}%`)}${td(q.concept_id ? `<button type="button" class="btn-chip" onclick="openConceptModal('${escapeJsStr(q.concept_id)}', '${escapeJsStr(q.sub)}')">觀念</button>` : "")}</tr>`
+              )
+              .join("")
+          )
+    }
+  `;
+  triggerKaTeXRender(el);
+}
+
+async function showStudentDetail(username) {
+  const el = document.getElementById("admin-log-student-detail");
+  if (!el) return;
+  el.classList.remove("hidden");
+  el.innerHTML = loadingBoxHtml("正在讀取學生的作答明細...");
+  const student = (adminLogData && adminLogData.students.find(s => s.username === username)) || { name: username, cohort: "" };
+  try {
+    const res = await callGasApi("getStudentDetail", { username, from: adminLogQuery.from, to: adminLogQuery.to });
+    if (!res || !res.success) throw new Error((res && res.message) || "無法取得學生明細");
+    const sessionsHtml = res.sessions.length === 0
+      ? `<div class="empty-state-box">此區間沒有測驗紀錄。</div>`
+      : tableHtml(
+          ["時間", "測驗名稱", "成績", "答錯題數"],
+          res.sessions
+            .map(s => `<tr>${td(escapeHtml(formatTaiwanDateTime(s.timestamp)), "white-space: nowrap;")}${td(escapeHtml(s.unit_title))}${td(escapeHtml(s.score))}${td(s.wrongCount)}</tr>`)
+            .join("")
+        );
+    const lectureHtml = res.perLecture.length === 0
+      ? ""
+      : `<h4 style="margin: 16px 0 8px;">各講義答對率（此區間）</h4>` +
+        tableHtml(
+          ["講義", "作答題數", "答對", "答對率"],
+          res.perLecture
+            .sort((a, b) => a.accuracy - b.accuracy)
+            .map(m => `<tr>${td(escapeHtml(m.main))}${td(m.attempts)}${td(m.correct)}${td(`${m.accuracy}%`)}</tr>`)
+            .join("")
+        );
+    const mistakesHtml = res.mistakes.length === 0
+      ? `<div class="empty-state-box">目前沒有未訂正的錯題。</div>`
+      : tableHtml(
+          ["題目", "講義・子分類"],
+          res.mistakes
+            .map(m => `<tr>${td(`${escapeHtml(m.prompt)}<div style="color: #15803d; margin-top: 4px;">✓ ${escapeHtml(m.correctAnswer)}</div>`)}${td(escapeHtml(`${m.main}・${m.sub}`))}</tr>`)
+            .join("")
+        );
+    el.innerHTML = `
+      <div class="taxonomy-header">
+        <h3 class="section-title">🔍 ${escapeHtml(student.name)}（${escapeHtml(username)}）・${escapeHtml(student.cohort || "未分班")}</h3>
+        <button type="button" class="btn-outline" onclick="document.getElementById('admin-log-student-detail').classList.add('hidden')">關閉</button>
+      </div>
+      <h4 style="margin: 8px 0;">測驗紀錄（${escapeHtml(adminLogQuery.label)}）</h4>
+      ${sessionsHtml}
+      ${lectureHtml}
+      <h4 style="margin: 16px 0 8px;">目前未訂正的錯題（${res.mistakes.length} 題）</h4>
+      ${mistakesHtml}
+    `;
+    triggerKaTeXRender(el);
+  } catch (err) {
+    console.error(err);
+    el.innerHTML = `<div class="empty-state-box">❌ 讀取失敗：${escapeHtml(err.message || "請稍後再試")}</div>`;
+  }
+}
+
+/* ============================================================================
+ * [MODULE 10.0] 學生註冊（登入畫面）
+ * ============================================================================ */
+function showRegisterForm() {
+  document.getElementById("login-form-box").classList.add("hidden");
+  document.getElementById("register-form-box").classList.remove("hidden");
+}
+
+function showLoginForm() {
+  document.getElementById("register-form-box").classList.add("hidden");
+  document.getElementById("login-form-box").classList.remove("hidden");
+}
+
+async function handleRegister() {
+  const val = id => ((document.getElementById(id) || {}).value || "").trim();
+  const code = val("reg-code");
+  const name = val("reg-name");
+  const username = val("reg-username");
+  const username2 = val("reg-username2");
+  const statusEl = document.getElementById("register-status");
+  const btn = document.getElementById("register-btn");
+  const show = (text, cls) => {
+    if (statusEl) {
+      statusEl.textContent = text;
+      statusEl.className = `login-status ${cls}`;
+    }
+  };
+
+  if (!code || !name || !username) return show("⚠️ 請填寫註冊碼、姓名與想使用的帳號！", "error");
+  if (username !== username2) return show("⚠️ 兩次輸入的帳號不一致，請再確認。", "error");
+  if (!/^[A-Za-z0-9_]{4,20}$/.test(username)) return show("⚠️ 帳號須為 4 到 20 個英文字母、數字或底線（_）。", "error");
+
+  try {
+    if (btn) btn.disabled = true;
+    show("🔄 正在送出註冊...", "loading");
+    const res = await callGasApi("register", { code, name, username });
+    if (!res || !res.success) return show(`❌ ${(res && res.message) || "註冊失敗，請稍後再試"}`, "error");
+    ["reg-code", "reg-name", "reg-username", "reg-username2"].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.value = "";
+    });
+    show(`✅ ${res.message || "註冊完成！"}`, "success");
+  } catch (err) {
+    console.error(err);
+    show(`❌ 網路或雲端連線異常：${err.message || "請稍後再試"}`, "error");
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+/* ============================================================================
+ * [MODULE 11.0] 管理者「👤 帳號管理」頁面
+ * 頁面上不顯示任何密碼；需要密碼時一律傳送到 Discord
+ * ============================================================================ */
+let accountsData = null;
+let accountsInitialized = false;
+
+function initAccountsView() {
+  if (!accountsInitialized) {
+    accountsInitialized = true;
+    loadAccounts();
+  }
+}
+
+async function loadAccounts() {
+  const container = document.getElementById("accounts-table");
+  if (container) container.innerHTML = loadingBoxHtml("正在讀取名單與帳號...");
+  try {
+    const res = await callGasApi("adminListAccounts", {});
+    if (!res || !res.success) throw new Error((res && res.message) || "無法讀取帳號資料");
+    accountsData = res;
+    const cohorts = Array.from(new Set(res.accounts.map(a => a.cohort || "未分班"))).sort();
+    setSelectOptions("accounts-filter-cohort", [
+      { value: "ALL", label: "全部班別" },
+      ...cohorts.map(c => ({ value: c, label: c }))
+    ]);
+    renderAccounts();
+  } catch (err) {
+    console.error(err);
+    if (container) container.innerHTML = `<div class="empty-state-box">❌ 讀取失敗：${escapeHtml(err.message || "請稍後再試")}</div>`;
+  }
+}
+
+function accountButtons(a) {
+  const u = escapeJsStr(a.username);
+  const n = escapeJsStr(a.name);
+  const c = escapeJsStr(a.cohort || "");
+  const btn = (type, label) =>
+    `<button type="button" class="btn-chip" style="margin: 2px;" onclick="accountAction('${type}', '${u}', '${n}', '${c}')">${label}</button>`;
+  if (a.status === "未註冊") return btn("register", "代為註冊");
+  if (a.status === "管理者") return "—";
+  return [
+    btn("reset", "重設密碼"),
+    btn("resend", "傳送密碼"),
+    a.status === "停用" ? btn("enable", "啟用") : btn("disable", "停用"),
+    btn("cohort", "改班別"),
+    btn("rename", "改帳號")
+  ].join("");
+}
+
+function renderAccounts() {
+  if (!accountsData) return;
+  const discordEl = document.getElementById("accounts-discord-status");
+  if (discordEl) {
+    discordEl.textContent = accountsData.discordReady ? "🟢 Discord 已設定" : "🔴 Discord 尚未設定（密碼無法傳送）";
+  }
+
+  const cohortsEl = document.getElementById("accounts-cohorts");
+  if (cohortsEl) {
+    cohortsEl.innerHTML =
+      accountsData.cohorts.length === 0
+        ? `<div class="empty-state-box">尚未建立 Cohorts 工作表（班別、註冊碼、是否開放註冊）。</div>`
+        : tableHtml(
+            ["班別", "註冊碼", "開放註冊"],
+            accountsData.cohorts
+              .map(c => `<tr>${td(escapeHtml(c.cohort))}${td(escapeHtml(c.code || "（未設定）"))}${td(c.open ? "✅ 開放" : "⛔ 關閉")}</tr>`)
+              .join("")
+          );
+  }
+
+  const cohort = (document.getElementById("accounts-filter-cohort") || {}).value || "ALL";
+  const status = (document.getElementById("accounts-filter-status") || {}).value || "ALL";
+  const keyword = ((document.getElementById("accounts-search") || {}).value || "").trim().toLowerCase();
+  const list = accountsData.accounts.filter(a => {
+    if (cohort !== "ALL" && (a.cohort || "未分班") !== cohort) return false;
+    if (status !== "ALL" && a.status !== status) return false;
+    if (keyword && !`${a.name} ${a.username}`.toLowerCase().includes(keyword)) return false;
+    return true;
+  });
+
+  const counts = accountsData.accounts.reduce((acc, a) => {
+    acc[a.status] = (acc[a.status] || 0) + 1;
+    return acc;
+  }, {});
+  const summaryEl = document.getElementById("accounts-summary");
+  if (summaryEl) {
+    summaryEl.textContent = `使用中 ${counts["使用中"] || 0}・未註冊 ${counts["未註冊"] || 0}・停用 ${counts["停用"] || 0}`;
+  }
+
+  const container = document.getElementById("accounts-table");
+  if (!container) return;
+  container.innerHTML =
+    list.length === 0
+      ? `<div class="empty-state-box">沒有符合條件的學生。</div>`
+      : tableHtml(
+          ["姓名", "班別", "帳號", "狀態", "註冊時間", "操作"],
+          list
+            .map(a => {
+              const statusStyle = a.status === "停用" ? "color: #b91c1c;" : a.status === "未註冊" ? "color: #64748b;" : "";
+              return `<tr>${td(escapeHtml(a.name) + (a.inRoster ? "" : ' <span style="color:#64748b;">（不在名單）</span>'))}${td(escapeHtml(a.cohort || "未分班"))}${td(escapeHtml(a.username || "—"))}${td(escapeHtml(a.status), statusStyle)}${td(a.registered_at ? escapeHtml(formatTaiwanDateTime(a.registered_at)) : "—", "white-space: nowrap;")}${td(accountButtons(a))}</tr>`;
+            })
+            .join("")
+        );
+}
+
+async function accountAction(type, username, name, cohort) {
+  let action = "";
+  let payload = { username };
+  if (type === "register") {
+    const u = prompt(`為「${name}」設定帳號（4 到 20 個英文字母、數字或底線）：`);
+    if (!u) return;
+    action = "adminRegister";
+    payload = { name, cohort, username: u.trim() };
+  } else if (type === "reset") {
+    if (!confirm(`確定要重設 ${name}（${username}）的密碼嗎？\n新密碼會傳到 Discord，舊密碼立即失效。`)) return;
+    action = "adminResetPassword";
+  } else if (type === "resend") {
+    if (!confirm(`要把 ${name}（${username}）目前的密碼傳到 Discord 嗎？`)) return;
+    action = "adminResendPassword";
+  } else if (type === "disable" || type === "enable") {
+    const disabled = type === "disable";
+    if (!confirm(`確定要${disabled ? "停用" : "啟用"} ${name}（${username}）的帳號嗎？${disabled ? "\n已登入的裝置也會立即登出。" : ""}`)) return;
+    action = "adminSetStatus";
+    payload = { username, disabled };
+  } else if (type === "cohort") {
+    const c = prompt(`輸入 ${name} 的新班別（需與 Access 表的班別名稱一致）：`, cohort);
+    if (!c || c.trim() === cohort) return;
+    action = "adminSetCohort";
+    payload = { username, cohort: c.trim() };
+  } else if (type === "rename") {
+    const n = prompt(`輸入 ${name} 的新帳號（4 到 20 個英文字母、數字或底線）：`, username);
+    if (!n || n.trim() === username) return;
+    action = "adminRenameUsername";
+    payload = { username, newUsername: n.trim() };
+  } else {
+    return;
+  }
+
+  try {
+    const res = await callGasApi(action, payload);
+    if (!res || !res.success) {
+      alert(`❌ ${(res && res.message) || "操作失敗"}`);
+      return;
+    }
+    let msg = res.message || "✅ 已完成";
+    if (res.delivered === true) msg = "✅ 已完成，密碼已傳到 Discord。";
+    if (res.delivered === false) msg = "⚠️ 已完成，但 Discord 傳送失敗。請確認 Discord 設定後，按「傳送密碼」重送。";
+    alert(msg);
+  } catch (err) {
+    console.error(err);
+    alert(`❌ 網路或雲端連線異常：${err.message || "請稍後再試"}`);
+  }
+  loadAccounts();
 }
 
 /* ============================================================================
