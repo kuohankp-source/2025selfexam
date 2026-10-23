@@ -11,6 +11,28 @@
   <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/contrib/auto-render.min.js" crossorigin="anonymous"></script>
   <!-- 系統主樣式表 -->
   <link rel="stylesheet" href="style.css" />
+  <style>
+    /* v3.2.4：題目、選項、解析與觀念卡的字體放大，數學式再額外放大 */
+    .quiz-prompt-box { font-size: 1.3rem; line-height: 1.75; }
+    .quiz-opt-btn .opt-content { font-size: 1.15rem; line-height: 1.7; }
+    .quiz-feedback-panel .feedback-header,
+    .quiz-feedback-panel .feedback-body { font-size: 1.1rem; line-height: 1.8; }
+    .mistake-card .mistake-prompt { font-size: 1.2rem; line-height: 1.75; }
+    .mistake-card .pick-box,
+    .mistake-card .mistake-exp-box { font-size: 1.1rem; line-height: 1.8; }
+    .history-accordion-body { font-size: 1.1rem; line-height: 1.8; }
+    .concept-card .concept-title { font-size: 1.25rem; }
+    .concept-card .concept-definition,
+    .concept-card .concept-premise,
+    .concept-card .concept-explanation { font-size: 1.12rem; line-height: 1.85; }
+    /* KaTeX 預設為 1.21em，以下區塊提高到 1.35em，分數與上下標更容易閱讀 */
+    .quiz-prompt-box .katex,
+    .quiz-opt-btn .katex,
+    .quiz-feedback-panel .katex,
+    .mistake-card .katex,
+    .history-accordion-body .katex,
+    .concept-card .katex { font-size: 1.35em; }
+  </style>
 </head>
 <body>
   <!-- [MODULE 3.1] 頂部永久品牌橫幅 (Global Top Banner) - 登入前與登入後皆常駐於頁面最上方 -->
@@ -248,7 +270,7 @@
             <!-- 第二層：子分類核取方塊清單 -->
             <div class="taxonomy-layer">
               <div class="layer-header-row">
-                <span class="layer-label">第二層｜勾選觀念子分類（sub_category）：</span>
+                <span class="layer-label">第二層｜勾選觀念子分類：</span>
                 <div class="quick-check-actions">
                   <button type="button" class="btn-chip" onclick="toggleAllSubCategories('study', true)">全選子分類</button>
                   <button type="button" class="btn-chip" onclick="toggleAllSubCategories('study', false)">全部取消</button>
@@ -309,7 +331,7 @@
             <!-- 第二層：子分類核取方塊清單 -->
             <div class="taxonomy-layer">
               <div class="layer-header-row">
-                <span class="layer-label">第二層｜勾選欲測驗之觀念子分類（sub_category）：</span>
+                <span class="layer-label">第二層｜勾選欲測驗之觀念子分類：</span>
                 <div class="quick-check-actions">
                   <button type="button" class="btn-chip" onclick="toggleAllSubCategories('quiz', true)">全選子分類</button>
                   <button type="button" class="btn-chip" onclick="toggleAllSubCategories('quiz', false)">全部取消</button>

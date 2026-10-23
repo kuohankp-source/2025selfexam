@@ -893,7 +893,8 @@ function renderMainCheckboxes(mode) {
   }
   grid.innerHTML = catalog
     .map(m => {
-      const countText = mode === "quiz" ? `${m.questionCount} 題` : `${m.conceptCount} 張觀念卡`;
+      // v3.2.4：快速測驗不顯示題數；觀念複習保留觀念卡數量
+      const countText = mode === "quiz" ? "" : `（${m.conceptCount} 張觀念卡）`;
       return `
         <label class="sub-check-item">
           <input
@@ -902,7 +903,7 @@ function renderMainCheckboxes(mode) {
             value="${escapeHtml(m.main)}"
             onchange="handleMainCategoryChange('${mode}')"
           />
-          <span>${escapeHtml(m.main)}（${countText}）</span>
+          <span>${escapeHtml(m.main)}${countText}</span>
         </label>
       `;
     })
@@ -937,7 +938,7 @@ function populateSubCategoryCheckboxes(mode) {
           .map(s => {
             const key = unitKey(m.main, s.sub);
             const checked = previouslyShown.has(key) ? previouslyChecked.has(key) : true;
-            const countText = mode === "quiz" ? `${s.questionCount} 題` : `${s.conceptCount} 張`;
+            const countText = mode === "quiz" ? "" : `（${s.conceptCount} 張）`;
             return `
               <label class="sub-check-item">
                 <input
@@ -947,7 +948,7 @@ function populateSubCategoryCheckboxes(mode) {
                   ${checked ? "checked" : ""}
                   onchange="${mode === "study" ? "updateStudyPendingHint()" : "updateQuizAvailableCount()"}"
                 />
-                <span>${escapeHtml(s.sub)}（${countText}）</span>
+                <span>${escapeHtml(s.sub)}${countText}</span>
               </label>
             `;
           })
